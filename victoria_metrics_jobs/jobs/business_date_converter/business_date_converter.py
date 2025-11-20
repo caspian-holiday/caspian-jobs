@@ -289,8 +289,11 @@ class BusinessDateConverterJob(BaseJob):
                     self.logger.info(f"Found {len(grouped_metrics)} unique metric series+business_date combinations for job {job_name}")
                     
                     # Convert each metric
-                    for (metric_name, labels_without_biz_date, biz_date_str), (value, original_timestamp) in grouped_metrics.items():
+                    for (metric_name, labels_tuple, biz_date_str), (value, original_timestamp) in grouped_metrics.items():
                         try:
+                            # Convert labels_tuple back to dict
+                            labels_without_biz_date = dict(labels_tuple)
+                            
                             # Parse biz_date - format is "dd/mm/yyyy"
                             try:
                                 business_date = datetime.strptime(biz_date_str, '%d/%m/%Y').date()
@@ -348,13 +351,14 @@ class BusinessDateConverterJob(BaseJob):
     
     def _query_grouped_metrics(
         self, prom: PrometheusConnect, job_name: str, start_time: datetime, end_time: datetime
-    ) -> Dict[Tuple[str, Dict[str, str], str], Tuple[float, float]]:
+    ) -> Dict[Tuple[str, tuple, str], Tuple[float, float]]:
         """Query metrics from VM with server-side grouping to get latest value per series+business_date.
         
         Uses PromQL last_over_time() to get the latest value per metric series and business_date.
         This is much more efficient than fetching all data points and grouping locally.
         
-        Returns dict: {(metric_name, labels_dict, business_date_str): (value, timestamp)}
+        Returns dict: {(metric_name, labels_tuple, biz_date_str): (value, timestamp)}
+        where labels_tuple is tuple(sorted(labels.items())) for hashability
         """
         grouped = {}
         
@@ -404,7 +408,9 @@ class BusinessDateConverterJob(BaseJob):
                         value = float(value_data[1])
                         
                         # Create key: (metric_name, labels_without_biz_date, biz_date)
-                        key = (metric_name, labels, biz_date_str)
+                        # Convert labels dict to tuple of sorted items for hashability
+                        labels_tuple = tuple(sorted(labels.items()))
+                        key = (metric_name, labels_tuple, biz_date_str)
                         
                         # Store value and timestamp
                         # If key already exists, keep the one with latest timestamp
