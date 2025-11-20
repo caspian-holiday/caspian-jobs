@@ -1,0 +1,53 @@
+# Example Scheduler Configuration with PostgreSQL Database
+# This file demonstrates how to configure the scheduler with database locking
+
+# Global settings
+max_workers: 5
+
+# Database settings for job locking
+database:
+  host: localhost
+  port: 5432
+  name: scheduler
+  user: scheduler
+  password: your_secure_password_here
+  ssl_mode: prefer
+  connection_timeout: 10
+
+# Job definitions - Only Python script jobs are supported
+jobs:
+  # Example: System A Extractor Job
+  - id: system_a_extractor
+    name: System A Data Extraction
+    enabled: true
+    script: "/opt/scheduler/jobs/extractor/extractor.py"
+    args: ["--config", "/etc/scheduler/jobs/extractor.yml", "--job-id", "system_a_extractor"]
+    schedule:
+      type: cron
+      args:
+        hour: 2
+        minute: 0
+
+  # Example: System B Extractor Job
+  - id: system_b_extractor
+    name: System B Data Extraction
+    enabled: true
+    script: "/opt/scheduler/jobs/extractor/extractor.py"
+    args: ["--config", "/etc/scheduler/jobs/extractor.yml", "--job-id", "system_b_extractor"]
+    schedule:
+      type: cron
+      args:
+        hour: 2
+        minute: 30
+
+  # Example: Apex Number Collection Job
+  - id: apex_collector
+    name: Apex Number Collection
+    enabled: true
+    script: "/opt/scheduler/jobs/apex-collector/apex_collector.py"
+    args: ["--config", "/etc/scheduler/jobs/apex-collector.yml", "--job-id", "apex_collector"]
+    schedule:
+      type: cron
+      args:
+        hour: 1
+        minute: 0

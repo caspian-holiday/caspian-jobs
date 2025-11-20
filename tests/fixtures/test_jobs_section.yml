@@ -1,0 +1,36 @@
+# Test configuration with jobs section
+max_workers: 5
+
+jobs:
+  - id: system_a_extractor
+    name: System A Data Extraction
+    enabled: true
+    script: "/home/victor/code/scheduler/jobs/extractor/extractor.py"
+    args: ["--config", "/home/victor/code/scheduler/jobs/extractor/config.yml", "--job-id", "system_a_extractor"]
+    schedule:
+      type: cron
+      args:
+        hour: 2
+        minute: 0
+
+  - id: system_b_extractor
+    name: System B Data Extraction
+    enabled: true
+    script: "/home/victor/code/scheduler/jobs/extractor/extractor.py"
+    args: ["--config", "/home/victor/code/scheduler/jobs/extractor/config.yml", "--job-id", "system_b_extractor"]
+    schedule:
+      type: cron
+      args:
+        hour: 2
+        minute: 30
+
+  - id: prime_collector
+    name: Prime Number Collection
+    enabled: true
+    script: "/home/victor/code/scheduler/jobs/prime-collector/prime_collector.py"
+    args: ["--config", "/home/victor/code/scheduler/jobs/prime-collector/config.yml", "--job-id", "prime_collector"]
+    schedule:
+      type: cron
+      args:
+        hour: 1
+        minute: 0
