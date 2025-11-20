@@ -272,10 +272,13 @@ class BusinessDateConverterJob(BaseJob):
                     else:
                         # If no watermark, query from configured lookback period
                         lookback_days = state.job_config.get('watermark_lookback_days', 30)
-                        start_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-                        self.logger.info(f"No watermark found for job {job_name}, using lookback of {lookback_days} days")
+                        # Calculate start_time as lookback_days ago from now
+                        end_time = datetime.now(timezone.utc)
+                        start_time = end_time - timedelta(days=lookback_days)
+                        self.logger.info(f"No watermark found for job {job_name}, using lookback of {lookback_days} days from {end_time} to {start_time}")
                     
-                    end_time = datetime.now(timezone.utc)
+                    if watermark_ts:
+                        end_time = datetime.now(timezone.utc)
                     
                     self.logger.info(f"Querying metrics for job {job_name} from {start_time} to {end_time}")
                     
@@ -357,10 +360,18 @@ class BusinessDateConverterJob(BaseJob):
         
         try:
             # Calculate time range in seconds for PromQL
+            # last_over_time() looks back from the evaluation time (now), so we need to calculate
+            # how far back to look from end_time to cover start_time
             time_range_seconds = int((end_time - start_time).total_seconds())
             
+            # Ensure we have a positive time range
+            if time_range_seconds <= 0:
+                self.logger.warning(f"Invalid time range: start_time={start_time}, end_time={end_time}")
+                return {}
+            
             # Query all metrics with job label using last_over_time to get latest value per series
-            # This efficiently groups server-side and returns only the latest value per series+business_date
+            # This efficiently groups server-side and returns only the latest value per series+biz_date
+            # last_over_time looks back from now, so we use the calculated range
             base_query = f'{{job="{job_name}"}}'
             query = f'last_over_time({base_query}[{time_range_seconds}s])'
             
