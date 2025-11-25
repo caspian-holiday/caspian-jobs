@@ -323,11 +323,6 @@ class BusinessDateConverterJob(BaseJob):
                             
                             if success:
                                 state.metrics_converted += 1
-                                # Update watermark for this metric+biz_date
-                                self._update_metric_watermark(
-                                    state, metric_name, business_date, job_name,
-                                    labels_without_biz_date, converted_ts
-                                )
                             else:
                                 state.failed_count += 1
                             
@@ -431,53 +426,115 @@ class BusinessDateConverterJob(BaseJob):
         self, state: BusinessDateConverterState, prom: PrometheusConnect,
         metric_name: str, business_date: date, job_name: str, labels_without_biz_date: Dict[str, str]
     ) -> int:
-        """Calculate converted timestamp for a metric+business_date combination."""
+        """Calculate converted timestamp for a metric+business_date combination.
+        
+        Queries the converted series itself using range queries to find the max existing timestamp.
+        If no entry exists, returns 00:00:00.000 of the converted date.
+        If entry exists, returns max existing timestamp + 1 second offset.
+        """
         try:
-            # Build watermark metric query with all labels
-            # biz_date format is "dd/mm/yyyy"
-            biz_date_str = business_date.strftime('%d/%m/%Y')
-            label_filters = {
-                'biz_date': biz_date_str,
-                'metric_name': metric_name,
-                'source': job_name
-            }
-            # Add other labels (excluding job and biz_date which are already handled)
-            for k, v in labels_without_biz_date.items():
-                if k not in ['job', 'biz_date']:
-                    label_filters[k] = v
+            # Build query for the converted metric series (same as how it's written)
+            # Converted metrics have: same metric_name, labels without biz_date, source instead of job
+            converted_labels = labels_without_biz_date.copy()
+            converted_labels.pop('biz_date', None)  # Remove biz_date if present
+            if 'job' in converted_labels:
+                converted_labels['source'] = converted_labels.pop('job')
+            else:
+                converted_labels['source'] = job_name
             
-            # Build PromQL query
-            label_pairs = [f'{k}="{v}"' for k, v in sorted(label_filters.items())]
-            watermark_query = f'latest_converted_timestamp_by_metric_and_biz_date{{{",".join(label_pairs)}}}'
+            # Build PromQL query for the converted metric series
+            label_pairs = [f'{k}="{v}"' for k, v in sorted(converted_labels.items())]
+            converted_metric_query = f'{metric_name}{{{",".join(label_pairs)}}}'
             
-            query_result = prom.custom_query(query=watermark_query)
+            # Calculate time range for the business_date day (00:00:00 to 23:59:59 UTC)
+            start_datetime = datetime.combine(business_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+            end_datetime = datetime.combine(business_date, datetime.max.time().replace(microsecond=0)).replace(tzinfo=timezone.utc)
             
-            watermark_value = None
-            if query_result and len(query_result) > 0:
-                result = query_result[0]
-                if 'value' in result and result['value']:
-                    watermark_value = int(float(result['value'][1]))
+            start_timestamp = int(start_datetime.timestamp())
+            end_timestamp = int(end_datetime.timestamp())
+            
+            # Query the converted series using range query to get all data points for the day
+            max_existing_timestamp = self._query_max_timestamp_from_converted_series(
+                state, converted_metric_query, start_timestamp, end_timestamp
+            )
             
             # Calculate timestamp
-            midnight = datetime.combine(business_date, datetime.min.time())
-            midnight_ts = int(midnight.timestamp())
+            midnight_ts = start_timestamp  # 00:00:00.000 of the converted date
             
-            if watermark_value is None:
-                return midnight_ts  # First conversion: 00:00:00
+            if max_existing_timestamp is None:
+                # No entry exists: return 00:00:00.000 of the converted date
+                return midnight_ts
             
-            # Increment by 1 second
-            next_ts = watermark_value + 1
+            # Entry exists: max existing timestamp + 1 second offset
+            next_ts = max_existing_timestamp + 1
             
             # Ensure it stays in the same day (cap at 23:59:59)
-            end_of_day = datetime.combine(business_date, datetime.max.time().replace(microsecond=0))
-            end_of_day_ts = int(end_of_day.timestamp())
-            
-            return min(next_ts, end_of_day_ts)
+            return min(next_ts, end_timestamp)
             
         except Exception as e:
             self.logger.warning(f"Failed to calculate converted timestamp, using midnight: {e}")
-            midnight = datetime.combine(business_date, datetime.min.time())
+            midnight = datetime.combine(business_date, datetime.min.time()).replace(tzinfo=timezone.utc)
             return int(midnight.timestamp())
+    
+    def _query_max_timestamp_from_converted_series(
+        self, state: BusinessDateConverterState, metric_query: str, start_timestamp: int, end_timestamp: int
+    ) -> Optional[int]:
+        """Query the converted series using range query and return the max timestamp.
+        
+        Args:
+            state: Job state with VM configuration
+            metric_query: PromQL query for the converted metric series
+            start_timestamp: Start timestamp for the range query (Unix timestamp)
+            end_timestamp: End timestamp for the range query (Unix timestamp)
+            
+        Returns:
+            Max timestamp found in the range, or None if no data exists
+        """
+        try:
+            if not state.vm_query_url:
+                return None
+            
+            # Use VictoriaMetrics query_range API directly
+            headers = {}
+            if state.vm_token:
+                headers['Authorization'] = f'Bearer {state.vm_token}'
+            
+            # Build query_range URL
+            query_url = f"{state.vm_query_url}/api/v1/query_range"
+            
+            # Prepare query parameters
+            params = {
+                'query': metric_query,
+                'start': start_timestamp,
+                'end': end_timestamp,
+                'step': '1s'  # 1 second step to get all data points
+            }
+            
+            # Execute range query
+            response = requests.get(query_url, params=params, headers=headers, timeout=60)
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            # Parse response to find max timestamp
+            max_timestamp = None
+            if result.get('status') == 'success' and 'data' in result:
+                data = result['data']
+                if 'result' in data and isinstance(data['result'], list):
+                    for series in data['result']:
+                        if 'values' in series and isinstance(series['values'], list):
+                            for value_pair in series['values']:
+                                if isinstance(value_pair, list) and len(value_pair) >= 1:
+                                    # value_pair format: [timestamp, value]
+                                    timestamp = float(value_pair[0])
+                                    if max_timestamp is None or timestamp > max_timestamp:
+                                        max_timestamp = int(timestamp)
+            
+            return max_timestamp
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to query max timestamp from converted series: {e}")
+            return None
     
     def _write_converted_metric(
         self, state: BusinessDateConverterState, metric_name: str,
@@ -522,48 +579,6 @@ class BusinessDateConverterJob(BaseJob):
         except Exception as e:
             self.logger.error(f"Failed to write converted metric: {e}")
             return False
-    
-    def _update_metric_watermark(
-        self, state: BusinessDateConverterState,
-        metric_name: str, business_date: date, job_name: str,
-        labels_without_biz_date: Dict[str, str], timestamp: int
-    ) -> None:
-        """Update watermark metric for converted timestamp."""
-        try:
-            if not state.vm_gateway_url:
-                return
-            
-            # Build watermark metric labels
-            # biz_date format is "dd/mm/yyyy"
-            biz_date_str = business_date.strftime('%d/%m/%Y')
-            watermark_labels = {
-                'biz_date': biz_date_str,
-                'metric_name': metric_name,
-                'source': job_name
-            }
-            # Add other labels (excluding job and biz_date)
-            for k, v in labels_without_biz_date.items():
-                if k not in ['job', 'biz_date']:
-                    watermark_labels[k] = v
-            
-            label_pairs = [f'{k}="{v}"' for k, v in sorted(watermark_labels.items())]
-            watermark_line = f'latest_converted_timestamp_by_metric_and_biz_date{{{",".join(label_pairs)}}} {timestamp} {timestamp}'
-            
-            # Write watermark
-            headers = {'Content-Type': 'text/plain'}
-            if state.vm_token:
-                headers['Authorization'] = f'Bearer {state.vm_token}'
-            
-            response = requests.post(
-                f"{state.vm_gateway_url}/api/v1/import/prometheus",
-                data=watermark_line,
-                headers=headers,
-                timeout=30
-            )
-            response.raise_for_status()
-            
-        except Exception as e:
-            self.logger.warning(f"Failed to update metric watermark: {e}")
     
     # Step 4: Update job watermarks
     def _update_job_watermarks(self, state: BusinessDateConverterState) -> Result[BusinessDateConverterState, Exception]:
