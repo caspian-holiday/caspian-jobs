@@ -49,6 +49,7 @@ class MetricsForecastState(BaseJobState):
     forecast_types: List[Dict[str, str]] = field(default_factory=list)
     min_history_points: int = 30
     prophet_config: Dict[str, Any] = field(default_factory=dict)
+    prophet_fit_kwargs: Dict[str, Any] = field(default_factory=dict)
     vm_query_url: str = ""
     vm_gateway_url: str = ""
     vm_token: str = ""
@@ -113,7 +114,16 @@ class MetricsForecastJob(BaseJob):
                 "yearly_seasonality": True,
                 "seasonality_mode": "additive",
             }
-            prophet_config = {**default_prophet_config, **job_config.get("prophet", {})}
+            prophet_config_input = dict(job_config.get("prophet", {}) or {})
+            prophet_fit_kwargs = dict(job_config.get("prophet_fit", {}) or {})
+
+            # Allow legacy configs to place fit-only args inside prophet block
+            if "algorithm" in prophet_config_input and "algorithm" not in prophet_fit_kwargs:
+                prophet_fit_kwargs["algorithm"] = prophet_config_input.pop("algorithm")
+            if "iterations" in prophet_config_input and "iterations" not in prophet_fit_kwargs:
+                prophet_fit_kwargs["iterations"] = prophet_config_input.pop("iterations")
+
+            prophet_config = {**default_prophet_config, **prophet_config_input}
 
             victoria_metrics_cfg = job_config.get("victoria_metrics", {})
 
@@ -131,6 +141,7 @@ class MetricsForecastJob(BaseJob):
                 forecast_types=forecast_types,
                 min_history_points=int(job_config.get("min_history_points", 30)),
                 prophet_config=prophet_config,
+                prophet_fit_kwargs=prophet_fit_kwargs,
                 vm_query_url=victoria_metrics_cfg.get("query_url", ""),
                 vm_gateway_url=victoria_metrics_cfg.get("gateway_url", ""),
                 vm_token=victoria_metrics_cfg.get("token", ""),
@@ -277,7 +288,7 @@ class MetricsForecastJob(BaseJob):
                         continue
 
                     model = self._create_prophet_model(state)
-                    model.fit(training_df)
+                    model.fit(training_df, **state.prophet_fit_kwargs)
 
                     last_history_date = training_df["ds"].max().date()
                     future_dates = self._future_business_dates(

@@ -50,6 +50,9 @@ metrics_forecast:
     daily_seasonality: false
     yearly_seasonality: true
     seasonality_mode: additive
+  prophet_fit:
+    algorithm: MAP          # passed to Prophet.fit(...)
+    iterations: 500         # forwarded to underlying Stan backend
 ```
 
 ### Metric Selectors & Labels
@@ -57,6 +60,12 @@ metrics_forecast:
 - `source_job_names` contains the values you expect under `source_label` (default `source`). Override `source_label` if your metrics store the identifier elsewhere (e.g., `region`).
 - Each entry in `metric_selectors` can be a raw selector (`metric_name{label="value"}`) or use `$SOURCE`/`$JOB` placeholders (e.g., `requests_total{source="$SOURCE",env="dev"}`).
 - When placeholders are omitted, the job automatically injects `source_label="<value from source_job_names>"` into the selector so only matching series are fetched.
+
+### Prophet Tuning
+
+- Use the `prophet` block for constructor-level settings (seasonality, changepoints, growth, etc.).
+- Use the `prophet_fit` block to pass keyword arguments directly to `Prophet.fit()`, such as `algorithm`, `iterations`, `warmup`, or any other Stan sampling options.
+- For backwards compatibility, if `algorithm` or `iterations` are accidentally placed inside `prophet`, the job will move them to `prophet_fit` automatically.
 
 ### Forecast Types
 

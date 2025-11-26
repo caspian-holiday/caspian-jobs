@@ -106,6 +106,7 @@ Prophet-based forecasting pipeline that projects business-day metrics forward an
 - Supports multiple forecast types (trend, lower, upper) via `forecast` label
 - Filters series by a configurable label (default `source`) populated via `source_job_names`
 - Configurable history offset/window, horizon, and Prophet parameters
+- `prophet_fit` block passes kwargs straight to `Prophet.fit()` for tuning iterations, algorithm, etc.
 - Business-day aware timestamp fabrication (midnight start, +1s for reruns)
 
 **Usage:**
