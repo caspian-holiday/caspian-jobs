@@ -565,11 +565,8 @@ class BusinessDateConverterJob(BaseJob):
             prom = self._get_prometheus_client(state)
             
             # Access the session from PrometheusConnect for writing
-            # Some versions don't expose session, so fall back to creating a new one
-            session = getattr(prom, "session", None)
-            if session is None:
-                import requests
-                session = requests.Session()
+            # prometheus-api-client 0.6.0 stores session as _session (private attribute)
+            session = prom._session
             
             # Prepare headers for writing (VM-specific endpoint)
             write_headers = {'Content-Type': 'text/plain'}
