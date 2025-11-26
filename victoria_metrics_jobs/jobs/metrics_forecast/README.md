@@ -1,0 +1,76 @@
+# Metrics Forecast Job
+
+Prophet-powered forecasting pipeline that reads historical Victoria Metrics series filtered by `job` labels, generates business-day predictions, and publishes the results back to the same cluster. Each forecasted sample preserves every original label and adds a `forecast` label describing the variant (`trend`, `lower`, `upper`, etc.). Timestamps are fabricated at midnight for the target business date and incremented by one second for reruns covering the same horizon, ensuring idempotent writes.
+
+## Key Features
+
+- **Business-day aware**: Automatically skips weekends for both history windows and forward-looking horizons.
+- **Prophet configuration**: Default settings disable weekend seasonality and can be overridden via config.
+- **Multiple forecast variants**: Emit `yhat`, `yhat_lower`, `yhat_upper`, or any other Prophet column by configuring `forecast_types`.
+- **Prometheus client only**: Uses `prometheus-api-client` for both reads and remote writes to Victoria Metrics gateway.
+
+## Configuration Snippet
+
+```yaml
+metrics_forecast:
+  id: metrics_forecast
+  name: Metrics Forecast
+  enabled: true
+  script: "python"
+  args: ["-m", "victoria_metrics_jobs.jobs.metrics_forecast", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_forecast"]
+  schedule:
+    type: cron
+    args:
+      hour: 7
+      minute: 0
+
+  # Job settings
+  job_type: metrics_forecast
+  victoria_metrics: ${environments.dev.victoria_metrics}
+  source_job_names:
+    - apex_collector
+  metric_selectors:
+    - "{__name__!=\"\"}"
+  history_days: 365          # how many days of history to train on
+  history_offset_days: 0     # offset applied to the end of the history window
+  forecast_horizon_days: 20  # number of business days to forecast
+  min_history_points: 30
+  history_step_hours: 24     # sampling resolution for range queries
+  cutoff_hour: 6             # derive business date (UTC) before querying
+  forecast_types:
+    - name: trend
+      field: yhat
+    - name: lower
+      field: yhat_lower
+    - name: upper
+      field: yhat_upper
+  prophet:
+    weekly_seasonality: false
+    daily_seasonality: false
+    yearly_seasonality: true
+    seasonality_mode: additive
+```
+
+### Metric Selectors
+
+- Each entry in `metric_selectors` can be a raw selector (`metric_name{label="value"}`) or use the `$JOB` placeholder (e.g., `requests_total{job="$JOB",env="dev"}`).
+- If the placeholder is not used, the job automatically injects `job="<source_job_name>"` into the selector.
+
+### Forecast Types
+
+`forecast_types` links Prophet output columns to the value stored in the `forecast` label. For example, the configuration above produces:
+
+- `forecast="trend"` for `yhat`
+- `forecast="lower"` for `yhat_lower`
+- `forecast="upper"` for `yhat_upper`
+
+### Timestamp Fabrication
+
+For each forecasted business date:
+
+1. Start with midnight (`00:00:00`) timestamp.
+2. Query Victoria Metrics for existing samples with the same metric + labels.
+3. If entries exist, increment the timestamp by one second relative to the latest stored value.
+
+This guarantees deterministic ordering without overwriting previous runs targeting the same horizon.
+

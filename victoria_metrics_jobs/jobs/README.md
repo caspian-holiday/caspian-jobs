@@ -92,6 +92,30 @@ VM_JOBS_ENVIRONMENT=local poetry run python -m victoria_metrics_jobs.jobs.apex_c
 VM_JOBS_ENVIRONMENT=dev poetry run python -m victoria_metrics_jobs.jobs.apex_collector --config victoria_metrics_jobs/victoria_metrics_jobs.yml --job-id apex_collector --verbose
 ```
 
+### 3. Metrics Forecast Job (`metrics_forecast/`)
+Prophet-based forecasting pipeline that projects business-day metrics forward and republishes predictions to Victoria Metrics.
+
+**Workflow Steps:**
+1. Derive current business date anchor
+2. Collect historical series per configured job label and metric selector
+3. Train Prophet models (business-day frequency) and publish forecast variants
+4. Emit job status metrics for observability
+
+**Features:**
+- Prometheus client API for both queries and remote writes
+- Supports multiple forecast types (trend, lower, upper) via `forecast` label
+- Configurable history offset/window, horizon, and Prophet parameters
+- Business-day aware timestamp fabrication (midnight start, +1s for reruns)
+
+**Usage:**
+```bash
+# List available forecast job configurations
+VM_JOBS_ENVIRONMENT=local poetry run python -m victoria_metrics_jobs.jobs.metrics_forecast --config victoria_metrics_jobs/victoria_metrics_jobs.yml --list-jobs
+
+# Run metrics forecast job
+VM_JOBS_ENVIRONMENT=local poetry run python -m victoria_metrics_jobs.jobs.metrics_forecast --config victoria_metrics_jobs/victoria_metrics_jobs.yml --job-id metrics_forecast --verbose
+```
+
 ## Job Implementation Pattern
 
 All jobs follow the same functional pattern:
