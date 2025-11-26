@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 from prophet import Prophet
 from prometheus_api_client import PrometheusConnect
@@ -296,7 +297,7 @@ class MetricsForecastJob(BaseJob):
                         continue
                     
                     # Check for infinite or extremely large values that could crash Stan
-                    if training_df["y"].isinf().any():
+                    if np.isinf(training_df["y"]).any():
                         self.logger.warning(
                             "Skipping %s: training data contains infinite values",
                             series.metric_name,
