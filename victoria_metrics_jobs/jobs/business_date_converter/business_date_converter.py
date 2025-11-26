@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from prometheus_api_client import PrometheusConnect
-import requests
 
 # Add the scheduler module to the path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -202,12 +201,8 @@ class BusinessDateConverterJob(BaseJob):
                 state.job_watermarks = {job: None for job in state.source_job_names}
                 return Ok(state)
             
-            # Initialize Prometheus client
-            headers = {}
-            if state.vm_token:
-                headers['Authorization'] = f'Bearer {state.vm_token}'
-            
-            prom = PrometheusConnect(url=state.vm_query_url, headers=headers, disable_ssl=True)
+            # Initialize Prometheus client using helper method
+            prom = self._get_prometheus_client(state)
             
             job_watermarks = {}
             for job_name in state.source_job_names:
@@ -251,12 +246,8 @@ class BusinessDateConverterJob(BaseJob):
                 self.logger.error("No VM query URL configured")
                 return Err(Exception("VM query URL not configured"))
             
-            # Initialize Prometheus client
-            headers = {}
-            if state.vm_token:
-                headers['Authorization'] = f'Bearer {state.vm_token}'
-            
-            prom = PrometheusConnect(url=state.vm_query_url, headers=headers, disable_ssl=True)
+            # Initialize Prometheus client using helper method
+            prom = self._get_prometheus_client(state)
             
             # Process each job
             for job_name in state.source_job_names:
@@ -494,47 +485,106 @@ class BusinessDateConverterJob(BaseJob):
             if not state.vm_query_url:
                 return None
             
-            # Use VictoriaMetrics query_range API directly
-            headers = {}
-            if state.vm_token:
-                headers['Authorization'] = f'Bearer {state.vm_token}'
+            # Initialize Prometheus client using helper method
+            prom = self._get_prometheus_client(state)
             
-            # Build query_range URL
-            query_url = f"{state.vm_query_url}/api/v1/query_range"
+            # Convert timestamps to datetime objects for custom_query_range
+            start_time = datetime.fromtimestamp(start_timestamp, tz=timezone.utc)
+            end_time = datetime.fromtimestamp(end_timestamp, tz=timezone.utc)
             
-            # Prepare query parameters
-            params = {
-                'query': metric_query,
-                'start': start_timestamp,
-                'end': end_timestamp,
-                'step': '1s'  # 1 second step to get all data points
-            }
-            
-            # Execute range query
-            response = requests.get(query_url, params=params, headers=headers, timeout=60)
-            response.raise_for_status()
-            
-            result = response.json()
+            # Execute range query using Prometheus client API
+            query_result = prom.custom_query_range(
+                query=metric_query,
+                start_time=start_time,
+                end_time=end_time,
+                step='1s'  # 1 second step to get all data points
+            )
             
             # Parse response to find max timestamp
             max_timestamp = None
-            if result.get('status') == 'success' and 'data' in result:
-                data = result['data']
-                if 'result' in data and isinstance(data['result'], list):
-                    for series in data['result']:
-                        if 'values' in series and isinstance(series['values'], list):
-                            for value_pair in series['values']:
-                                if isinstance(value_pair, list) and len(value_pair) >= 1:
-                                    # value_pair format: [timestamp, value]
-                                    timestamp = float(value_pair[0])
-                                    if max_timestamp is None or timestamp > max_timestamp:
-                                        max_timestamp = int(timestamp)
+            if query_result and isinstance(query_result, dict):
+                if query_result.get('status') == 'success' and 'data' in query_result:
+                    data = query_result['data']
+                    if 'result' in data and isinstance(data['result'], list):
+                        for series in data['result']:
+                            if 'values' in series and isinstance(series['values'], list):
+                                for value_pair in series['values']:
+                                    if isinstance(value_pair, list) and len(value_pair) >= 1:
+                                        # value_pair format: [timestamp, value]
+                                        timestamp = float(value_pair[0])
+                                        if max_timestamp is None or timestamp > max_timestamp:
+                                            max_timestamp = int(timestamp)
             
             return max_timestamp
             
         except Exception as e:
             self.logger.warning(f"Failed to query max timestamp from converted series: {e}")
             return None
+    
+    def _get_prometheus_client(self, state: BusinessDateConverterState) -> PrometheusConnect:
+        """Get or create a PrometheusConnect instance for querying and writing metrics.
+        
+        Args:
+            state: Job state with VM configuration
+            
+        Returns:
+            PrometheusConnect instance configured with VM settings
+        """
+        headers = {}
+        if state.vm_token:
+            headers['Authorization'] = f'Bearer {state.vm_token}'
+        
+        # Use query URL if available, otherwise gateway URL
+        url = state.vm_query_url or state.vm_gateway_url
+        return PrometheusConnect(url=url, headers=headers, disable_ssl=True)
+    
+    def _write_metric_to_vm(
+        self, state: BusinessDateConverterState, metric_line: str, timeout: int = 60
+    ) -> bool:
+        """Write metric line to VictoriaMetrics using PrometheusConnect session.
+        
+        Uses PrometheusConnect's internal session to write metrics to VictoriaMetrics'
+        custom import endpoint. This provides a consistent Prometheus client API approach.
+        
+        Args:
+            state: Job state with VM configuration
+            metric_line: Metric line in Prometheus format
+            timeout: Request timeout in seconds
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            if not state.vm_gateway_url:
+                self.logger.error("No VM gateway URL configured")
+                return False
+            
+            # Get PrometheusConnect instance - it maintains a session internally
+            prom = self._get_prometheus_client(state)
+            
+            # Access the session from PrometheusConnect for writing
+            # PrometheusConnect uses requests.Session internally, which we can use
+            # for VictoriaMetrics' custom import endpoint
+            session = prom.session
+            
+            # Prepare headers for writing (VM-specific endpoint)
+            write_headers = {'Content-Type': 'text/plain'}
+            if state.vm_token:
+                write_headers['Authorization'] = f'Bearer {state.vm_token}'
+            
+            # Use PrometheusConnect's session to write metrics
+            response = session.post(
+                f"{state.vm_gateway_url}/api/v1/import/prometheus",
+                data=metric_line,
+                headers=write_headers,
+                timeout=timeout
+            )
+            response.raise_for_status()
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to write metric to VM: {e}")
+            return False
     
     def _write_converted_metric(
         self, state: BusinessDateConverterState, metric_name: str,
@@ -543,10 +593,6 @@ class BusinessDateConverterJob(BaseJob):
     ) -> bool:
         """Write converted metric to Victoria Metrics."""
         try:
-            if not state.vm_gateway_url:
-                self.logger.error("No VM gateway URL configured")
-                return False
-            
             # Copy labels and transform
             labels_dict = labels_without_biz_date.copy()
             
@@ -561,20 +607,8 @@ class BusinessDateConverterJob(BaseJob):
             label_pairs = [f'{k}="{v}"' for k, v in sorted(labels_dict.items())]
             metric_line = f'{metric_name}{{{",".join(label_pairs)}}} {value} {timestamp}'
             
-            # Write to VM gateway
-            headers = {'Content-Type': 'text/plain'}
-            if state.vm_token:
-                headers['Authorization'] = f'Bearer {state.vm_token}'
-            
-            response = requests.post(
-                f"{state.vm_gateway_url}/api/v1/import/prometheus",
-                data=metric_line,
-                headers=headers,
-                timeout=60
-            )
-            response.raise_for_status()
-            
-            return True
+            # Write to VM gateway using Prometheus client session
+            return self._write_metric_to_vm(state, metric_line, timeout=60)
             
         except Exception as e:
             self.logger.error(f"Failed to write converted metric: {e}")
@@ -598,19 +632,11 @@ class BusinessDateConverterJob(BaseJob):
                     
                     watermark_line = f'latest_converted_timestamp_by_job_wm{{source="{job_name}"}} {max_ts} {max_ts}'
                     
-                    headers = {'Content-Type': 'text/plain'}
-                    if state.vm_token:
-                        headers['Authorization'] = f'Bearer {state.vm_token}'
-                    
-                    response = requests.post(
-                        f"{state.vm_gateway_url}/api/v1/import/prometheus",
-                        data=watermark_line,
-                        headers=headers,
-                        timeout=30
-                    )
-                    response.raise_for_status()
-                    
-                    self.logger.info(f"Updated job watermark for {job_name} to {max_ts}")
+                    # Write watermark using Prometheus client session
+                    if self._write_metric_to_vm(state, watermark_line, timeout=30):
+                        self.logger.info(f"Updated job watermark for {job_name} to {max_ts}")
+                    else:
+                        raise Exception("Failed to write watermark metric")
                     
                 except Exception as e:
                     self.logger.warning(f"Failed to update job watermark for {job_name}: {e}")
@@ -649,20 +675,10 @@ class BusinessDateConverterJob(BaseJob):
             
             metric_line = f'business_date_converter_job_status{{{",".join(label_pairs)}}} {status_value} {timestamp}'
             
-            # Send to VM gateway
-            headers = {'Content-Type': 'text/plain'}
-            if state.vm_token:
-                headers['Authorization'] = f'Bearer {state.vm_token}'
+            # Send to VM gateway using Prometheus client session
+            if self._write_metric_to_vm(state, metric_line, timeout=30):
+                self.logger.info(f"Published job status metric: {state.status}")
             
-            response = requests.post(
-                f"{state.vm_gateway_url}/api/v1/import/prometheus",
-                data=metric_line,
-                headers=headers,
-                timeout=30
-            )
-            response.raise_for_status()
-            
-            self.logger.info(f"Published job status metric: {state.status}")
             return Ok(state)
             
         except Exception as e:
