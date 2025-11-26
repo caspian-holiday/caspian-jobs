@@ -276,8 +276,13 @@ class MetricsForecastJob(BaseJob):
             if not state.vm_gateway_url:
                 raise ValueError("victoria_metrics.gateway_url must be configured")
 
-            for series in state.series_histories:
+            for series_idx, series in enumerate(state.series_histories):
                 try:
+                    # Add small delay between series to avoid resource contention
+                    if series_idx > 0:
+                        import time
+                        time.sleep(0.5)  # 500ms delay between series
+                    
                     training_df = self._prepare_training_frame(series.samples)
                     if len(training_df) < state.min_history_points:
                         self.logger.info(
@@ -316,6 +321,15 @@ class MetricsForecastJob(BaseJob):
                         )
                         continue
                     
+                    # Warn about very large datasets that might cause memory issues
+                    if len(training_df) > 10000:
+                        self.logger.warning(
+                            "Large dataset for %s (%s points) may cause memory issues with cmdstanpy. "
+                            "Consider reducing history_days if crashes occur.",
+                            series.metric_name,
+                            len(training_df),
+                        )
+                    
                     # Log if there are NaNs (Prophet will drop them automatically)
                     nan_count = training_df["y"].isna().sum()
                     if nan_count > 0:
@@ -325,6 +339,29 @@ class MetricsForecastJob(BaseJob):
                             nan_count,
                             len(training_df),
                         )
+                    
+                    # Additional data validation
+                    # Check for constant values which can cause Stan compilation issues
+                    valid_y = training_df["y"].dropna()
+                    if len(valid_y) > 0:
+                        value_std = valid_y.std()
+                        if value_std == 0 or np.isnan(value_std):
+                            self.logger.warning(
+                                "Skipping %s: constant or invalid values (std=%s) may cause Stan issues",
+                                series.metric_name,
+                                value_std,
+                            )
+                            continue
+                        
+                        # Check for extreme value ranges that might cause numerical issues
+                        value_range = valid_y.max() - valid_y.min()
+                        if value_range > 1e10:
+                            self.logger.warning(
+                                "Skipping %s: extremely large value range (%s) may cause numerical instability",
+                                series.metric_name,
+                                value_range,
+                            )
+                            continue
 
                     model = self._create_prophet_model(state)
                     
@@ -341,12 +378,24 @@ class MetricsForecastJob(BaseJob):
                         except Exception as fit_error:
                             last_error = fit_error
                             error_msg = str(fit_error)
+                            error_msg_lower = error_msg.lower()
+                            
                             # Check for cmdstanpy/Stan errors
-                            if "cmdstanpy" in error_msg.lower() or "signal" in error_msg.lower() or "32212256857" in error_msg:
+                            is_cmdstan_error = (
+                                "cmdstanpy" in error_msg_lower
+                                or "cmdstan" in error_msg_lower
+                                or "signal" in error_msg_lower
+                                or "32212256857" in error_msg
+                                or "3221225657" in error_msg
+                                or "terminated by signal" in error_msg_lower
+                            )
+                            
+                            if is_cmdstan_error:
                                 if attempt < max_retries - 1:
-                                    wait_seconds = 2 ** attempt  # Exponential backoff
+                                    wait_seconds = (2 ** attempt) + 1  # Exponential backoff, min 2s
                                     self.logger.warning(
-                                        "Prophet fit failed (attempt %s/%s) for %s: %s. Retrying in %s seconds...",
+                                        "Prophet fit failed (attempt %s/%s) for %s due to cmdstanpy crash: %s. "
+                                        "Retrying in %s seconds...",
                                         attempt + 1,
                                         max_retries,
                                         series.metric_name,
@@ -355,11 +404,18 @@ class MetricsForecastJob(BaseJob):
                                     )
                                     import time
                                     time.sleep(wait_seconds)
-                                    # Recreate model for retry
+                                    
+                                    # Aggressive cleanup before retry
+                                    import gc
+                                    del model
+                                    gc.collect()
+                                    time.sleep(0.5)  # Additional small delay for cleanup
+                                    
+                                    # Recreate model for retry to clear any corrupted state
                                     model = self._create_prophet_model(state)
                                 else:
                                     self.logger.error(
-                                        "Prophet fit failed after %s attempts for %s: %s",
+                                        "Prophet fit failed after %s attempts for %s due to cmdstanpy crash: %s",
                                         max_retries,
                                         series.metric_name,
                                         error_msg[:200],
@@ -406,6 +462,11 @@ class MetricsForecastJob(BaseJob):
                                 state.forecasts_written += 1
 
                     state.series_processed += 1
+                    
+                    # Clean up model to free memory (helps prevent cmdstanpy crashes)
+                    del model
+                    import gc
+                    gc.collect()
 
                 except Exception as series_exc:
                     state.failed_series += 1
@@ -415,6 +476,9 @@ class MetricsForecastJob(BaseJob):
                         series.labels,
                         series_exc,
                     )
+                    # Clean up memory on failure to help prevent cascading crashes
+                    import gc
+                    gc.collect()
 
             return Ok(state)
         except Exception as exc:
@@ -591,11 +655,16 @@ class MetricsForecastJob(BaseJob):
         return future_dates
 
     def _create_prophet_model(self, state: MetricsForecastState) -> Prophet:
+        # Clean up any lingering Stan processes/resources before creating new model
+        import gc
+        gc.collect()
+        
         model = Prophet(**state.prophet_config)
         # Some downstream environments ship Prophet builds that forget to set this attribute.
         if not hasattr(model, "stan_backend"):
             model.stan_backend = None  # Prophet.fit() will populate a backend when None
             self.logger.debug("Prophet instance missing stan_backend attribute; initialized to None")
+        
         return model
 
     def _get_prometheus_client(self, state: MetricsForecastState) -> Optional[PrometheusConnect]:

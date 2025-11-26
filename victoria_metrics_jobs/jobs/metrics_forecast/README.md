@@ -87,14 +87,32 @@ This guarantees deterministic ordering without overwriting previous runs targeti
 
 ### Troubleshooting
 
-**cmdstanpy errors (signal 32212256857 or similar):**
+**cmdstanpy errors (signal 3221225657, 32212256857, or "terminated by signal"):**
 
-If you encounter cmdstanpy crashes during Prophet fitting, the job now includes automatic retry logic with exponential backoff. Common causes and solutions:
+If you encounter cmdstanpy crashes during Prophet fitting (Windows access violations), the job includes automatic retry logic with exponential backoff. Common causes and solutions:
 
-1. **Memory issues**: Reduce `history_days` or `forecast_horizon_days` to use less memory
-2. **Stan compilation**: Ensure cmdstanpy and Stan are properly installed: `pip install cmdstanpy` and run `cmdstanpy.install_cmdstan()`
-3. **Threading conflicts**: If running multiple forecast jobs in parallel, consider reducing parallelism
-4. **Data quality**: The job now validates training data (NaN, infinite values) before fitting
+1. **Memory issues**: 
+   - Reduce `history_days` to limit training data size (e.g., 180 days instead of 365)
+   - The job warns if datasets exceed 10,000 points
+   - Close other applications to free memory
 
-The job will automatically retry up to 3 times with exponential backoff if it detects cmdstanpy/Stan errors.
+2. **Windows compatibility**: 
+   - Ensure cmdstanpy and Stan are properly installed: `pip install cmdstanpy` and run `cmdstanpy.install_cmdstan()`
+   - On Windows, cmdstanpy may need Visual C++ redistributables
+   - Consider running on Linux/WSL if crashes persist
+
+3. **Resource contention**: 
+   - The job adds 500ms delays between series to avoid resource conflicts
+   - If running multiple forecast jobs in parallel, reduce parallelism
+   - Memory is cleaned up after each series (garbage collection)
+
+4. **Data quality**: 
+   - The job validates training data (NaN, infinite values) before fitting
+   - Very large or sparse datasets may cause issues
+
+5. **Stan compilation**: 
+   - First run may be slower as Stan compiles models
+   - Subsequent runs should be faster (compiled models are cached)
+
+The job automatically retries up to 3 times with exponential backoff (2s, 4s, 8s) when cmdstanpy crashes are detected. If crashes persist after retries, consider reducing dataset size or running on a different platform.
 
