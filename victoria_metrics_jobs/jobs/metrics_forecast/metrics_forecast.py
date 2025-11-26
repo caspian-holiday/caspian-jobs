@@ -499,7 +499,12 @@ class MetricsForecastJob(BaseJob):
         return future_dates
 
     def _create_prophet_model(self, state: MetricsForecastState) -> Prophet:
-        return Prophet(**state.prophet_config)
+        model = Prophet(**state.prophet_config)
+        # Some downstream environments ship Prophet builds that forget to set this attribute.
+        if not hasattr(model, "stan_backend"):
+            model.stan_backend = None  # Prophet.fit() will populate a backend when None
+            self.logger.debug("Prophet instance missing stan_backend attribute; initialized to None")
+        return model
 
     def _get_prometheus_client(self, state: MetricsForecastState) -> Optional[PrometheusConnect]:
         if state.prom_client:
@@ -523,7 +528,13 @@ class MetricsForecastJob(BaseJob):
             prom = self._get_prometheus_client(state)
             if prom is None:
                 return False
-            session = prom.session
+
+            session = getattr(prom, "session", None)
+            if session is None:
+                import requests
+
+                session = requests.Session()
+
             headers = {"Content-Type": "text/plain"}
             if state.vm_token:
                 headers["Authorization"] = f"Bearer {state.vm_token}"
