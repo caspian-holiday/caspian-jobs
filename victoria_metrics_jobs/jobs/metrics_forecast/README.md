@@ -85,3 +85,16 @@ For each forecasted business date:
 
 This guarantees deterministic ordering without overwriting previous runs targeting the same horizon.
 
+### Troubleshooting
+
+**cmdstanpy errors (signal 32212256857 or similar):**
+
+If you encounter cmdstanpy crashes during Prophet fitting, the job now includes automatic retry logic with exponential backoff. Common causes and solutions:
+
+1. **Memory issues**: Reduce `history_days` or `forecast_horizon_days` to use less memory
+2. **Stan compilation**: Ensure cmdstanpy and Stan are properly installed: `pip install cmdstanpy` and run `cmdstanpy.install_cmdstan()`
+3. **Threading conflicts**: If running multiple forecast jobs in parallel, consider reducing parallelism
+4. **Data quality**: The job now validates training data (NaN, infinite values) before fitting
+
+The job will automatically retry up to 3 times with exponential backoff if it detects cmdstanpy/Stan errors.
+

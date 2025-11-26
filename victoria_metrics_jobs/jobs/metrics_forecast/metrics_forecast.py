@@ -286,9 +286,89 @@ class MetricsForecastJob(BaseJob):
                             state.min_history_points,
                         )
                         continue
+                    
+                    # Validate training data before fitting
+                    if training_df.empty or training_df["y"].isna().all():
+                        self.logger.warning(
+                            "Skipping %s: training data is empty or all NaN",
+                            series.metric_name,
+                        )
+                        continue
+                    
+                    # Check for infinite or extremely large values that could crash Stan
+                    if training_df["y"].isinf().any():
+                        self.logger.warning(
+                            "Skipping %s: training data contains infinite values",
+                            series.metric_name,
+                        )
+                        continue
+                    
+                    # Prophet can handle NaNs by dropping those rows, but we need enough valid points
+                    # Count non-NaN values to ensure we have sufficient data after Prophet drops NaNs
+                    valid_points = training_df["y"].notna().sum()
+                    if valid_points < state.min_history_points:
+                        self.logger.warning(
+                            "Skipping %s: insufficient valid data points (%s < %s) after accounting for NaNs",
+                            series.metric_name,
+                            valid_points,
+                            state.min_history_points,
+                        )
+                        continue
+                    
+                    # Log if there are NaNs (Prophet will drop them automatically)
+                    nan_count = training_df["y"].isna().sum()
+                    if nan_count > 0:
+                        self.logger.debug(
+                            "Series %s has %s NaN values (out of %s total); Prophet will drop these rows",
+                            series.metric_name,
+                            nan_count,
+                            len(training_df),
+                        )
 
                     model = self._create_prophet_model(state)
-                    model.fit(training_df, **state.prophet_fit_kwargs)
+                    
+                    # Fit Prophet model with retry logic for cmdstanpy stability
+                    max_retries = 3
+                    fit_success = False
+                    last_error = None
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            model.fit(training_df, **state.prophet_fit_kwargs)
+                            fit_success = True
+                            break
+                        except Exception as fit_error:
+                            last_error = fit_error
+                            error_msg = str(fit_error)
+                            # Check for cmdstanpy/Stan errors
+                            if "cmdstanpy" in error_msg.lower() or "signal" in error_msg.lower() or "32212256857" in error_msg:
+                                if attempt < max_retries - 1:
+                                    wait_seconds = 2 ** attempt  # Exponential backoff
+                                    self.logger.warning(
+                                        "Prophet fit failed (attempt %s/%s) for %s: %s. Retrying in %s seconds...",
+                                        attempt + 1,
+                                        max_retries,
+                                        series.metric_name,
+                                        error_msg[:200],
+                                        wait_seconds,
+                                    )
+                                    import time
+                                    time.sleep(wait_seconds)
+                                    # Recreate model for retry
+                                    model = self._create_prophet_model(state)
+                                else:
+                                    self.logger.error(
+                                        "Prophet fit failed after %s attempts for %s: %s",
+                                        max_retries,
+                                        series.metric_name,
+                                        error_msg[:200],
+                                    )
+                            else:
+                                # Non-cmdstanpy error, don't retry
+                                raise
+                    
+                    if not fit_success:
+                        raise Exception(f"Prophet fit failed after {max_retries} attempts: {last_error}")
 
                     last_history_date = training_df["ds"].max().date()
                     future_dates = self._future_business_dates(
