@@ -493,11 +493,13 @@ class BusinessDateConverterJob(BaseJob):
             end_time = datetime.fromtimestamp(end_timestamp, tz=timezone.utc)
             
             # Execute range query using Prometheus client API
+            # Use 1 minute step for day queries to avoid too many data points
+            # This is sufficient to find the max timestamp while keeping query size reasonable
             query_result = prom.custom_query_range(
                 query=metric_query,
                 start_time=start_time,
                 end_time=end_time,
-                step='1s'  # 1 second step to get all data points
+                step='1m'  # 1 minute step - sufficient for finding max timestamp
             )
             
             # Parse response to find max timestamp
@@ -563,16 +565,18 @@ class BusinessDateConverterJob(BaseJob):
             prom = self._get_prometheus_client(state)
             
             # Access the session from PrometheusConnect for writing
-            # PrometheusConnect uses requests.Session internally, which we can use
-            # for VictoriaMetrics' custom import endpoint
-            session = prom.session
+            # Some versions don't expose session, so fall back to creating a new one
+            session = getattr(prom, "session", None)
+            if session is None:
+                import requests
+                session = requests.Session()
             
             # Prepare headers for writing (VM-specific endpoint)
             write_headers = {'Content-Type': 'text/plain'}
             if state.vm_token:
                 write_headers['Authorization'] = f'Bearer {state.vm_token}'
             
-            # Use PrometheusConnect's session to write metrics
+            # Use session to write metrics
             response = session.post(
                 f"{state.vm_gateway_url}/api/v1/import/prometheus",
                 data=metric_line,
