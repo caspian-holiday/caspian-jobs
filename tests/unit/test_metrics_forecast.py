@@ -21,6 +21,52 @@ def test_build_metric_selector_injects_source(job):
     result = job._build_metric_selector(selector, "source", "forecast-job")
     assert 'source="forecast-job"' in result
     assert 'env="dev"' in result
+    # Should include PromQL filter to exclude forecast labels
+    assert 'forecast!~".+"' in result
+
+
+def test_parse_range_query_excludes_forecast_labels(job):
+    """Test that _parse_range_query filters out metrics with forecast label."""
+    from datetime import datetime, timezone
+    
+    query_result = {
+        "status": "success",
+        "data": {
+            "result": [
+                {
+                    "metric": {
+                        "__name__": "requests_total",
+                        "source": "apex_collector",
+                        "env": "dev"
+                    },
+                    "values": [[1609459200, "100"]]
+                },
+                {
+                    "metric": {
+                        "__name__": "requests_total",
+                        "source": "apex_collector",
+                        "env": "dev",
+                        "forecast": "trend"  # This should be excluded
+                    },
+                    "values": [[1609459200, "110"]]
+                },
+                {
+                    "metric": {
+                        "__name__": "requests_total",
+                        "source": "apex_collector",
+                        "env": "dev",
+                        "forecast": "lower"  # This should also be excluded
+                    },
+                    "values": [[1609459200, "90"]]
+                }
+            ]
+        }
+    }
+    
+    histories = job._parse_range_query(query_result, "source", "apex_collector")
+    # Should only return 1 series (the one without forecast label)
+    assert len(histories) == 1
+    assert "forecast" not in histories[0].labels
 
 
 def test_prepare_training_frame_fills_business_days(job):

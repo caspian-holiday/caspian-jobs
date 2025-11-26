@@ -540,11 +540,21 @@ class MetricsForecastJob(BaseJob):
 
         def ensure_label(label_body: str) -> str:
             if re.search(label_pattern, label_body):
-                return re.sub(label_pattern, f'{label_key}="{label_value}"', label_body)
-            label_body = label_body.strip()
-            if label_body:
-                return f'{label_body},{label_key}="{label_value}"'
-            return f'{label_key}="{label_value}"'
+                label_body = re.sub(label_pattern, f'{label_key}="{label_value}"', label_body)
+            else:
+                label_body = label_body.strip()
+                if label_body:
+                    label_body = f'{label_body},{label_key}="{label_value}"'
+                else:
+                    label_body = f'{label_key}="{label_value}"'
+            
+            # Exclude metrics with forecast label using PromQL regex negative match
+            # forecast!~".+" means "forecast does not match any non-empty string"
+            # This effectively matches only metrics where forecast label doesn't exist
+            if 'forecast!~' not in label_body:
+                label_body = f'{label_body},forecast!~".+"'
+            
+            return label_body
 
         if "{" in selector and selector.endswith("}"):
             metric_name, label_body = selector.split("{", 1)
@@ -585,6 +595,12 @@ class MetricsForecastJob(BaseJob):
                 continue
 
             labels = {k: v for k, v in metric.items() if k != "__name__"}
+            
+            # Skip metrics that have a forecast label (these are generated forecasts)
+            # We exclude any metric with forecast label, regardless of its value
+            if "forecast" in labels:
+                continue
+            
             values = item.get("values", []) or []
             samples: List[Tuple[datetime, float]] = []
 
