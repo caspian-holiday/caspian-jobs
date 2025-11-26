@@ -16,10 +16,10 @@ def job():
     return MetricsForecastJob()
 
 
-def test_build_metric_selector_injects_job(job):
+def test_build_metric_selector_injects_source(job):
     selector = 'requests_total{env="dev"}'
-    result = job._build_metric_selector(selector, "forecast-job")
-    assert 'job="forecast-job"' in result
+    result = job._build_metric_selector(selector, "source", "forecast-job")
+    assert 'source="forecast-job"' in result
     assert 'env="dev"' in result
 
 

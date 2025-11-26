@@ -28,7 +28,7 @@ class SeriesHistory:
 
     metric_name: str
     labels: Dict[str, str]
-    job_name: str
+    source_value: str
     samples: List[Tuple[datetime, float]]
 
 
@@ -40,6 +40,7 @@ class MetricsForecastState(BaseJobState):
     history_start_date: Optional[date] = None
     history_end_date: Optional[date] = None
     source_job_names: List[str] = field(default_factory=list)
+    source_label: str = "source"
     metric_selectors: List[str] = field(default_factory=list)
     history_days: int = 365
     history_offset_days: int = 0
@@ -121,6 +122,7 @@ class MetricsForecastJob(BaseJob):
                 job_config=job_config,
                 started_at=datetime.now(),
                 source_job_names=source_job_names,
+                source_label=job_config.get("source_label", "source"),
                 metric_selectors=metric_selectors,
                 history_days=int(job_config.get("history_days", 365)),
                 history_offset_days=int(job_config.get("history_offset_days", 0)),
@@ -218,23 +220,28 @@ class MetricsForecastJob(BaseJob):
 
             collected: List[SeriesHistory] = []
 
-            for job_name in state.source_job_names:
+            for source_name in state.source_job_names:
                 for selector in state.metric_selectors:
-                    query = self._build_metric_selector(selector, job_name)
+                    query = self._build_metric_selector(
+                        selector, state.source_label, source_name
+                    )
                     query_result = prom.custom_query_range(
                         query=query,
                         start_time=start_dt,
                         end_time=end_dt,
                         step=step_str,
                     )
-                    series = self._parse_range_query(query_result, job_name)
+                    series = self._parse_range_query(
+                        query_result, state.source_label, source_name
+                    )
                     collected.extend(series)
 
             state.series_histories = collected
             self.logger.info(
-                "Collected %s metric series across %s job labels",
+                "Collected %s metric series across %s %s labels",
                 len(collected),
                 len(state.source_job_names),
+                state.source_label,
             )
 
             return Ok(state)
@@ -363,47 +370,39 @@ class MetricsForecastJob(BaseJob):
             return [item.strip() for item in value.split(",") if item.strip()]
         return []
 
-    def _build_metric_selector(self, selector: str, job_name: str) -> str:
-        """Ensure job label is included in selector; supports $JOB placeholder."""
+    def _build_metric_selector(
+        self, selector: str, label_key: str, label_value: str
+    ) -> str:
+        """Ensure the desired label is present in the selector (supports $JOB/$SOURCE)."""
         selector = selector.strip()
-        if "$JOB" in selector:
-            return selector.replace("$JOB", job_name)
+
+        for placeholder in ("$JOB", "$SOURCE"):
+            if placeholder in selector:
+                selector = selector.replace(placeholder, label_value)
+
+        label_pattern = rf'{label_key}\s*=\s*"[^"]*"'
+
+        def ensure_label(label_body: str) -> str:
+            if re.search(label_pattern, label_body):
+                return re.sub(label_pattern, f'{label_key}="{label_value}"', label_body)
+            label_body = label_body.strip()
+            if label_body:
+                return f'{label_body},{label_key}="{label_value}"'
+            return f'{label_key}="{label_value}"'
 
         if "{" in selector and selector.endswith("}"):
             metric_name, label_body = selector.split("{", 1)
-            label_body = label_body.rstrip("}")
-            if "job=" in label_body:
-                label_body = re.sub(
-                    r'job\s*=\s*"[^"]*"',
-                    f'job="{job_name}"',
-                    label_body,
-                )
-            else:
-                if label_body.strip():
-                    label_body = f'{label_body},job="{job_name}"'
-                else:
-                    label_body = f'job="{job_name}"'
+            label_body = ensure_label(label_body.rstrip("}"))
             return f"{metric_name}{{{label_body}}}"
 
         if selector.startswith("{") and selector.endswith("}"):
-            label_body = selector.strip("{}")
-            if "job=" in label_body:
-                label_body = re.sub(
-                    r'job\s*=\s*"[^"]*"',
-                    f'job="{job_name}"',
-                    label_body,
-                )
-            else:
-                if label_body.strip():
-                    label_body = f'{label_body},job="{job_name}"'
-                else:
-                    label_body = f'job="{job_name}"'
+            label_body = ensure_label(selector.strip("{}"))
             return f"{{{label_body}}}"
 
-        return f'{selector}{{job="{job_name}"}}'
+        return f'{selector}{{{label_key}="{label_value}"}}'
 
     def _parse_range_query(
-        self, query_result: Any, job_name: str
+        self, query_result: Any, label_key: str, label_value: str
     ) -> List[SeriesHistory]:
         """Parse Prometheus range query response into SeriesHistory objects."""
         if not query_result:
@@ -411,7 +410,11 @@ class MetricsForecastJob(BaseJob):
 
         if isinstance(query_result, dict):
             if query_result.get("status") != "success":
-                self.logger.warning("Prometheus query unsuccessful for job %s", job_name)
+                self.logger.warning(
+                    "Prometheus query unsuccessful for %s=%s",
+                    label_key,
+                    label_value,
+                )
                 return []
             data = query_result.get("data", {})
             raw_series = data.get("result", [])
@@ -444,7 +447,7 @@ class MetricsForecastJob(BaseJob):
                     SeriesHistory(
                         metric_name=metric_name,
                         labels=labels,
-                        job_name=job_name,
+                        source_value=label_value,
                         samples=samples,
                     )
                 )

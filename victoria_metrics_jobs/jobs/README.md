@@ -104,6 +104,7 @@ Prophet-based forecasting pipeline that projects business-day metrics forward an
 **Features:**
 - Prometheus client API for both queries and remote writes
 - Supports multiple forecast types (trend, lower, upper) via `forecast` label
+- Filters series by a configurable label (default `source`) populated via `source_job_names`
 - Configurable history offset/window, horizon, and Prophet parameters
 - Business-day aware timestamp fabrication (midnight start, +1s for reruns)
 

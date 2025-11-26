@@ -152,6 +152,7 @@ environments:
         victoria_metrics: ${environments.local.victoria_metrics}
         source_job_names:
           - apex_collector
+        source_label: source
         metric_selectors:
           - "{}"
         history_days: 365
@@ -323,6 +324,7 @@ environments:
         victoria_metrics: ${environments.dev.victoria_metrics}
         source_job_names:
           - apex_collector
+        source_label: source
         metric_selectors:
           - "{}"
         history_days: 365

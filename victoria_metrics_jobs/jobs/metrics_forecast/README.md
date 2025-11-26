@@ -1,6 +1,6 @@
 # Metrics Forecast Job
 
-Prophet-powered forecasting pipeline that reads historical Victoria Metrics series filtered by `job` labels, generates business-day predictions, and publishes the results back to the same cluster. Each forecasted sample preserves every original label and adds a `forecast` label describing the variant (`trend`, `lower`, `upper`, etc.). Timestamps are fabricated at midnight for the target business date and incremented by one second for reruns covering the same horizon, ensuring idempotent writes.
+Prophet-powered forecasting pipeline that reads historical Victoria Metrics series filtered by a configurable label (default `source`), generates business-day predictions, and publishes the results back to the same cluster. Each forecasted sample preserves every original label and adds a `forecast` label describing the variant (`trend`, `lower`, `upper`, etc.). Timestamps are fabricated at midnight for the target business date and incremented by one second for reruns covering the same horizon, ensuring idempotent writes.
 
 ## Key Features
 
@@ -29,6 +29,7 @@ metrics_forecast:
   victoria_metrics: ${environments.dev.victoria_metrics}
   source_job_names:
     - apex_collector
+  source_label: source
   metric_selectors:
     - "{__name__!=\"\"}"
   history_days: 365          # how many days of history to train on
@@ -51,10 +52,11 @@ metrics_forecast:
     seasonality_mode: additive
 ```
 
-### Metric Selectors
+### Metric Selectors & Labels
 
-- Each entry in `metric_selectors` can be a raw selector (`metric_name{label="value"}`) or use the `$JOB` placeholder (e.g., `requests_total{job="$JOB",env="dev"}`).
-- If the placeholder is not used, the job automatically injects `job="<source_job_name>"` into the selector.
+- `source_job_names` contains the values you expect under `source_label` (default `source`). Override `source_label` if your metrics store the identifier elsewhere (e.g., `region`).
+- Each entry in `metric_selectors` can be a raw selector (`metric_name{label="value"}`) or use `$SOURCE`/`$JOB` placeholders (e.g., `requests_total{source="$SOURCE",env="dev"}`).
+- When placeholders are omitted, the job automatically injects `source_label="<value from source_job_names>"` into the selector so only matching series are fetched.
 
 ### Forecast Types
 
