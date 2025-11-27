@@ -378,50 +378,36 @@ class MetricsForecastJob(BaseJob):
                         except Exception as fit_error:
                             last_error = fit_error
                             error_msg = str(fit_error)
-                            error_msg_lower = error_msg.lower()
                             
-                            # Check for cmdstanpy/Stan errors
-                            is_cmdstan_error = (
-                                "cmdstanpy" in error_msg_lower
-                                or "cmdstan" in error_msg_lower
-                                or "signal" in error_msg_lower
-                                or "32212256857" in error_msg
-                                or "3221225657" in error_msg
-                                or "terminated by signal" in error_msg_lower
-                            )
-                            
-                            if is_cmdstan_error:
-                                if attempt < max_retries - 1:
-                                    wait_seconds = (2 ** attempt) + 1  # Exponential backoff, min 2s
-                                    self.logger.warning(
-                                        "Prophet fit failed (attempt %s/%s) for %s due to cmdstanpy crash: %s. "
-                                        "Retrying in %s seconds...",
-                                        attempt + 1,
-                                        max_retries,
-                                        series.metric_name,
-                                        error_msg[:200],
-                                        wait_seconds,
-                                    )
-                                    import time
-                                    time.sleep(wait_seconds)
-                                    
-                                    # Aggressive cleanup before retry
-                                    import gc
-                                    del model
-                                    gc.collect()
-                                    time.sleep(0.5)  # Additional small delay for cleanup
-                                    
-                                    # Recreate model for retry to clear any corrupted state
-                                    model = self._create_prophet_model(state)
-                                else:
-                                    self.logger.error(
-                                        "Prophet fit failed after %s attempts for %s due to cmdstanpy crash: %s",
-                                        max_retries,
-                                        series.metric_name,
-                                        error_msg[:200],
-                                    )
+                            if attempt < max_retries - 1:
+                                wait_seconds = (2 ** attempt) + 1  # Exponential backoff, min 2s
+                                self.logger.warning(
+                                    "Prophet fit failed (attempt %s/%s) for %s: %s. "
+                                    "Retrying in %s seconds...",
+                                    attempt + 1,
+                                    max_retries,
+                                    series.metric_name,
+                                    error_msg[:200],
+                                    wait_seconds,
+                                )
+                                import time
+                                time.sleep(wait_seconds)
+                                
+                                # Cleanup before retry
+                                import gc
+                                del model
+                                gc.collect()
+                                time.sleep(0.5)  # Additional small delay for cleanup
+                                
+                                # Recreate model for retry to clear any corrupted state
+                                model = self._create_prophet_model(state)
                             else:
-                                # Non-cmdstanpy error, don't retry
+                                self.logger.error(
+                                    "Prophet fit failed after %s attempts for %s: %s",
+                                    max_retries,
+                                    series.metric_name,
+                                    error_msg[:200],
+                                )
                                 raise
                     
                     if not fit_success:
@@ -442,31 +428,19 @@ class MetricsForecastJob(BaseJob):
                     unique_forecast_dates = sorted(set(forecast_dates))
                     
                     # Batch lookup existing forecast timestamps once per series
+                    # CRITICAL: Use series.labels directly - this must match exactly what we write
+                    # When writing: labels = series.labels.copy() then labels["forecast"] = name
+                    # When querying: labels = base_labels.copy() then labels["forecast"] = forecast_type_name
+                    # So base_labels must equal series.labels for the query to match what was written
                     timestamp_map = self._batch_lookup_forecast_timestamps(
                         state,
                         prom,
                         series.metric_name,
-                        series.labels,
+                        series.labels,  # Use series.labels directly - must match what we write
                         state.forecast_types,
                         unique_forecast_dates,
                     )
                     
-                    # Log timestamp map contents for debugging
-                    self.logger.debug(
-                        "Timestamp map for %s: %s entries",
-                        series.metric_name,
-                        len([v for v in timestamp_map.values() if v is not None]),
-                    )
-                    for (fd, ft), ts in timestamp_map.items():
-                        if ts is not None:
-                            self.logger.debug(
-                                "  %s/%s on %s: existing_ts=%s",
-                                series.metric_name,
-                                ft,
-                                fd,
-                                ts,
-                            )
-
                     publish_rows: List[Dict[str, Any]] = []
                     for future_row in forecast_df.itertuples():
                         forecast_date = future_row.ds.date()
@@ -489,27 +463,10 @@ class MetricsForecastJob(BaseJob):
                                 # Increment by 1 minute for deterministic overwriting (matches query step)
                                 end_dt = datetime.combine(forecast_date, datetime.max.time()).replace(tzinfo=timezone.utc)
                                 timestamp = min(existing_max_ts + 60, int(end_dt.timestamp()))
-                                self.logger.info(
-                                    "Using incremented timestamp for %s/%s on %s: existing_max_ts=%s -> new_ts=%s (increment=%s)",
-                                    series.metric_name,
-                                    name,
-                                    forecast_date,
-                                    existing_max_ts,
-                                    timestamp,
-                                    timestamp - existing_max_ts,
-                                )
                             else:
                                 # No existing forecast, use midnight timestamp
                                 start_dt = datetime.combine(forecast_date, datetime.min.time()).replace(tzinfo=timezone.utc)
                                 timestamp = int(start_dt.timestamp())
-                                self.logger.warning(
-                                    "No existing forecast found in map for %s/%s on %s, using midnight timestamp: %s (map keys: %s)",
-                                    series.metric_name,
-                                    name,
-                                    forecast_date,
-                                    timestamp,
-                                    list(timestamp_map.keys())[:10] if timestamp_map else "empty",
-                                )
                             
                             publish_rows.append(
                                 {
@@ -521,30 +478,7 @@ class MetricsForecastJob(BaseJob):
                             )
 
                     if publish_rows:
-                        # Log timestamps being written for debugging
-                        timestamps_by_date = {}
-                        for row in publish_rows:
-                            date_key = (row["metric_name"], row["labels"].get("forecast"), row["timestamp"])
-                            if date_key not in timestamps_by_date:
-                                timestamps_by_date[date_key] = []
-                            timestamps_by_date[date_key].append(row)
-                        
-                        # Check for duplicate timestamps in the same batch
-                        duplicates = {k: v for k, v in timestamps_by_date.items() if len(v) > 1}
-                        if duplicates:
-                            self.logger.warning(
-                                "Found duplicate timestamps in batch for %s: %s",
-                                series.metric_name,
-                                list(duplicates.keys())[:5],
-                            )
-                        
                         forecast_batch_df = pd.DataFrame(publish_rows)
-                        self.logger.info(
-                            "Writing %s forecast points for %s (sample timestamps: %s)",
-                            len(forecast_batch_df),
-                            series.metric_name,
-                            [row["timestamp"] for row in publish_rows[:3]],
-                        )
                         if self._write_metrics_dataframe_to_vm(
                             state, forecast_batch_df, timeout=60
                         ):
@@ -887,7 +821,8 @@ class MetricsForecastJob(BaseJob):
             if not forecast_type_name:
                 continue
             
-            # Build labels with forecast type
+            # Build labels with forecast type (must match exactly how we write them)
+            # CRITICAL: This must match exactly: labels = series.labels.copy() then labels["forecast"] = name
             labels = base_labels.copy()
             labels["forecast"] = forecast_type_name
             
@@ -902,14 +837,6 @@ class MetricsForecastJob(BaseJob):
                 try:
                     # Query the entire day with 1m step to find max timestamp
                     # This is manageable (~1440 points per day) and ensures we find all timestamps
-                    self.logger.debug(
-                        "Querying for existing forecasts: %s on %s (range: %s to %s)",
-                        query,
-                        forecast_date,
-                        start_dt,
-                        end_dt,
-                    )
-                    
                     query_result = prom.custom_query_range(
                         query=query,
                         start_time=start_dt,
@@ -919,54 +846,33 @@ class MetricsForecastJob(BaseJob):
                     
                     # Parse response to find max timestamp (same structure as business_date_converter)
                     max_ts = None
-                    value_count = 0
                     if query_result and isinstance(query_result, dict):
                         if query_result.get("status") == "success" and "data" in query_result:
                             data = query_result["data"]
                             if "result" in data and isinstance(data["result"], list):
-                                for series in data["result"]:
-                                    if "values" in series and isinstance(series["values"], list):
-                                        value_count += len(series["values"])
-                                        for value_pair in series["values"]:
+                                for series_result in data["result"]:
+                                    if "values" in series_result and isinstance(series_result["values"], list):
+                                        for value_pair in series_result["values"]:
                                             if isinstance(value_pair, list) and len(value_pair) >= 1:
                                                 # value_pair format: [timestamp, value]
                                                 timestamp = float(value_pair[0])
                                                 if max_ts is None or timestamp > max_ts:
                                                     max_ts = int(timestamp)
                         else:
+                            error_type = query_result.get("errorType")
+                            error = query_result.get("error")
                             self.logger.warning(
-                                "Query failed or unexpected format for %s/%s on %s: status=%s",
+                                "Query failed for %s/%s on %s: status=%s, errorType=%s, error=%s",
                                 metric_name,
                                 forecast_type_name,
                                 forecast_date,
                                 query_result.get("status"),
+                                error_type,
+                                error,
                             )
-                    
-                    self.logger.info(
-                        "Lookup result for %s/%s on %s: found %s values, max_ts=%s",
-                        metric_name,
-                        forecast_type_name,
-                        forecast_date,
-                        value_count,
-                        max_ts,
-                    )
                     
                     if max_ts is not None:
                         timestamp_map[(forecast_date, forecast_type_name)] = max_ts
-                        self.logger.debug(
-                            "Found existing forecast for %s/%s on %s with max_ts=%s",
-                            metric_name,
-                            forecast_type_name,
-                            forecast_date,
-                            max_ts,
-                        )
-                    else:
-                        self.logger.debug(
-                            "No existing forecast found for %s/%s on %s",
-                            metric_name,
-                            forecast_type_name,
-                            forecast_date,
-                        )
                         
                 except Exception as exc:
                     self.logger.warning(
