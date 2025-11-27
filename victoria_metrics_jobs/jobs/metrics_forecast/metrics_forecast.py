@@ -489,24 +489,26 @@ class MetricsForecastJob(BaseJob):
                                 # Increment by 1 minute for deterministic overwriting (matches query step)
                                 end_dt = datetime.combine(forecast_date, datetime.max.time()).replace(tzinfo=timezone.utc)
                                 timestamp = min(existing_max_ts + 60, int(end_dt.timestamp()))
-                                self.logger.debug(
-                                    "Using incremented timestamp for %s/%s on %s: %s -> %s",
+                                self.logger.info(
+                                    "Using incremented timestamp for %s/%s on %s: existing_max_ts=%s -> new_ts=%s (increment=%s)",
                                     series.metric_name,
                                     name,
                                     forecast_date,
                                     existing_max_ts,
                                     timestamp,
+                                    timestamp - existing_max_ts,
                                 )
                             else:
                                 # No existing forecast, use midnight timestamp
                                 start_dt = datetime.combine(forecast_date, datetime.min.time()).replace(tzinfo=timezone.utc)
                                 timestamp = int(start_dt.timestamp())
-                                self.logger.debug(
-                                    "No existing forecast found for %s/%s on %s, using midnight timestamp: %s",
+                                self.logger.warning(
+                                    "No existing forecast found in map for %s/%s on %s, using midnight timestamp: %s (map keys: %s)",
                                     series.metric_name,
                                     name,
                                     forecast_date,
                                     timestamp,
+                                    list(timestamp_map.keys())[:10] if timestamp_map else "empty",
                                 )
                             
                             publish_rows.append(
@@ -877,6 +879,14 @@ class MetricsForecastJob(BaseJob):
                 try:
                     # Query the entire day with 1m step to find max timestamp
                     # This is manageable (~1440 points per day) and ensures we find all timestamps
+                    self.logger.debug(
+                        "Querying for existing forecasts: %s on %s (range: %s to %s)",
+                        query,
+                        forecast_date,
+                        start_dt,
+                        end_dt,
+                    )
+                    
                     query_result = prom.custom_query_range(
                         query=query,
                         start_time=start_dt,
@@ -886,18 +896,37 @@ class MetricsForecastJob(BaseJob):
                     
                     # Parse response to find max timestamp (same structure as business_date_converter)
                     max_ts = None
+                    value_count = 0
                     if query_result and isinstance(query_result, dict):
                         if query_result.get("status") == "success" and "data" in query_result:
                             data = query_result["data"]
                             if "result" in data and isinstance(data["result"], list):
                                 for series in data["result"]:
                                     if "values" in series and isinstance(series["values"], list):
+                                        value_count += len(series["values"])
                                         for value_pair in series["values"]:
                                             if isinstance(value_pair, list) and len(value_pair) >= 1:
                                                 # value_pair format: [timestamp, value]
                                                 timestamp = float(value_pair[0])
                                                 if max_ts is None or timestamp > max_ts:
                                                     max_ts = int(timestamp)
+                        else:
+                            self.logger.warning(
+                                "Query failed or unexpected format for %s/%s on %s: status=%s",
+                                metric_name,
+                                forecast_type_name,
+                                forecast_date,
+                                query_result.get("status"),
+                            )
+                    
+                    self.logger.info(
+                        "Lookup result for %s/%s on %s: found %s values, max_ts=%s",
+                        metric_name,
+                        forecast_type_name,
+                        forecast_date,
+                        value_count,
+                        max_ts,
+                    )
                     
                     if max_ts is not None:
                         timestamp_map[(forecast_date, forecast_type_name)] = max_ts
