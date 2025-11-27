@@ -437,6 +437,20 @@ class MetricsForecastJob(BaseJob):
                     future_df = pd.DataFrame({"ds": future_dates})
                     forecast_df = model.predict(future_df)
 
+                    # Extract unique forecast dates for batch timestamp lookup
+                    forecast_dates = [row.ds.date() for row in forecast_df.itertuples()]
+                    unique_forecast_dates = sorted(set(forecast_dates))
+                    
+                    # Batch lookup existing forecast timestamps once per series
+                    timestamp_map = self._batch_lookup_forecast_timestamps(
+                        state,
+                        prom,
+                        series.metric_name,
+                        series.labels,
+                        state.forecast_types,
+                        unique_forecast_dates,
+                    )
+
                     publish_rows: List[Dict[str, Any]] = []
                     for future_row in forecast_df.itertuples():
                         forecast_date = future_row.ds.date()
@@ -452,9 +466,18 @@ class MetricsForecastJob(BaseJob):
                             labels = series.labels.copy()
                             labels["forecast"] = name
 
-                            timestamp = self._calculate_forecast_timestamp(
-                                state, prom, series.metric_name, labels, forecast_date
-                            )
+                            # Look up timestamp from batch lookup map
+                            existing_max_ts = timestamp_map.get((forecast_date, name))
+                            
+                            if existing_max_ts is not None:
+                                # Increment by 1 second for deterministic overwriting
+                                end_dt = datetime.combine(forecast_date, datetime.max.time()).replace(tzinfo=timezone.utc)
+                                timestamp = min(existing_max_ts + 1, int(end_dt.timestamp()))
+                            else:
+                                # No existing forecast, use midnight timestamp
+                                start_dt = datetime.combine(forecast_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+                                timestamp = int(start_dt.timestamp())
+                            
                             publish_rows.append(
                                 {
                                     "metric_name": series.metric_name,
@@ -764,6 +787,107 @@ class MetricsForecastJob(BaseJob):
         except Exception as exc:
             self.logger.error("Failed to write %s to VM: %s", context, exc)
             return False
+
+    def _batch_lookup_forecast_timestamps(
+        self,
+        state: MetricsForecastState,
+        prom: PrometheusConnect,
+        metric_name: str,
+        base_labels: Dict[str, str],
+        forecast_types: List[Dict[str, str]],
+        forecast_dates: List[date],
+    ) -> Dict[Tuple[date, str], Optional[int]]:
+        """Batch lookup existing forecast timestamps for all forecast dates and types.
+        
+        Queries VictoriaMetrics once per forecast_type for the entire date range,
+        then returns a map of (forecast_date, forecast_type_name) -> max_timestamp.
+        
+        Args:
+            state: Job state object
+            prom: Prometheus client for querying VM
+            metric_name: Name of the metric
+            base_labels: Labels without the forecast type label
+            forecast_types: List of forecast type configs with 'name' field
+            forecast_dates: List of forecast dates to check
+            
+        Returns:
+            Dictionary mapping (forecast_date, forecast_type_name) -> max_timestamp (or None)
+        """
+        if not forecast_dates:
+            return {}
+        
+        # Calculate date range for query (start of first date to end of last date)
+        min_date = min(forecast_dates)
+        max_date = max(forecast_dates)
+        start_dt = datetime.combine(min_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+        end_dt = datetime.combine(max_date, datetime.max.time()).replace(tzinfo=timezone.utc)
+        
+        # Initialize result map with None for all combinations
+        timestamp_map: Dict[Tuple[date, str], Optional[int]] = {}
+        for forecast_date in forecast_dates:
+            for forecast_type in forecast_types:
+                forecast_type_name = forecast_type.get("name")
+                if forecast_type_name:
+                    timestamp_map[(forecast_date, forecast_type_name)] = None
+        
+        # Query once per forecast_type for the entire date range
+        for forecast_type in forecast_types:
+            forecast_type_name = forecast_type.get("name")
+            if not forecast_type_name:
+                continue
+            
+            # Build labels with forecast type
+            labels = base_labels.copy()
+            labels["forecast"] = forecast_type_name
+            
+            label_pairs = [f'{k}="{v}"' for k, v in sorted(labels.items())]
+            query = f'{metric_name}{{{",".join(label_pairs)}}}'
+            
+            try:
+                query_result = prom.custom_query_range(
+                    query=query,
+                    start_time=start_dt,
+                    end_time=end_dt,
+                    step="1s",
+                )
+                
+                # Parse results to find max timestamp per date
+                if isinstance(query_result, dict):
+                    data = query_result.get("data", {})
+                    results = data.get("result", [])
+                else:
+                    results = query_result or []
+                
+                # Track max timestamp per date for this forecast type
+                date_max_ts: Dict[date, int] = {}
+                
+                for series in results:
+                    for value_pair in series.get("values", []):
+                        if not isinstance(value_pair, (list, tuple)) or not value_pair:
+                            continue
+                        ts_value = int(float(value_pair[0]))
+                        ts_dt = datetime.fromtimestamp(ts_value, tz=timezone.utc)
+                        ts_date = ts_dt.date()
+                        
+                        # Only consider timestamps for dates in our forecast range
+                        if ts_date in forecast_dates:
+                            if ts_date not in date_max_ts or ts_value > date_max_ts[ts_date]:
+                                date_max_ts[ts_date] = ts_value
+                
+                # Update timestamp map with found max timestamps
+                for forecast_date in forecast_dates:
+                    if forecast_date in date_max_ts:
+                        timestamp_map[(forecast_date, forecast_type_name)] = date_max_ts[forecast_date]
+                        
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to batch lookup timestamps for forecast_type=%s: %s",
+                    forecast_type_name,
+                    exc,
+                )
+                # Continue with other forecast types even if one fails
+        
+        return timestamp_map
 
     def _calculate_forecast_timestamp(
         self,
