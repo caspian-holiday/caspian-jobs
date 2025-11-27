@@ -195,12 +195,21 @@ class BusinessDateConverterJob(BaseJob):
     
     # Step 2: Read job watermarks
     def _read_job_watermarks(self, state: BusinessDateConverterState) -> Result[BusinessDateConverterState, Exception]:
-        """Read job watermarks from VictoriaMetrics to determine last processed timestamps."""
+        """Read job watermarks from VictoriaMetrics to determine last processed timestamps.
+        
+        Uses last_over_time() to look back in time (default 30 days) to find the latest
+        watermark value, even if it hasn't been updated recently.
+        """
         try:
             if not state.vm_query_url:
                 self.logger.warning("No VM query URL configured, will process all metrics")
                 state.job_watermarks = {job: None for job in state.source_job_names}
                 return Ok(state)
+            
+            # Get lookback period from config (default 30 days)
+            # This ensures we find watermarks even if they haven't been updated recently
+            watermark_lookback_days = state.job_config.get('watermark_lookback_days', 30)
+            lookback_duration = f'{watermark_lookback_days}d'
             
             # Initialize Prometheus client using helper method
             prom = self._get_prometheus_client(state)
@@ -208,11 +217,13 @@ class BusinessDateConverterJob(BaseJob):
             job_watermarks = {}
             for job_name in state.source_job_names:
                 try:
-                    # Query for job watermark metric
+                    # Query for job watermark metric using last_over_time() to look back in time
+                    # This ensures we get the latest value even if it's old
                     watermark_metric = f'latest_converted_timestamp_by_job_wm{{source="{job_name}"}}'
+                    promql_query = f'last_over_time({watermark_metric}[{lookback_duration}])'
                     
-                    # Query using PromQL
-                    query_result = prom.custom_query(query=watermark_metric)
+                    # Query using PromQL instant query
+                    query_result = prom.custom_query(query=promql_query)
                     
                     if query_result and len(query_result) > 0:
                         # Get the latest value
@@ -220,16 +231,28 @@ class BusinessDateConverterJob(BaseJob):
                         if 'value' in result and result['value']:
                             timestamp = float(result['value'][1])  # Prometheus format: [timestamp, value]
                             job_watermarks[job_name] = int(timestamp)
-                            self.logger.info(f"Job watermark for {job_name}: {job_watermarks[job_name]}")
+                            self.logger.info(
+                                f"Job watermark for {job_name}: {job_watermarks[job_name]} "
+                                f"(found looking back {watermark_lookback_days} days)"
+                            )
                         else:
                             job_watermarks[job_name] = None
-                            self.logger.info(f"No watermark found for job {job_name}")
+                            self.logger.info(
+                                f"No watermark found for job {job_name} "
+                                f"(searched back {watermark_lookback_days} days)"
+                            )
                     else:
                         job_watermarks[job_name] = None
-                        self.logger.info(f"No watermark found for job {job_name}")
+                        self.logger.info(
+                            f"No watermark found for job {job_name} "
+                            f"(searched back {watermark_lookback_days} days)"
+                        )
                         
                 except Exception as e:
-                    self.logger.warning(f"Failed to read watermark for job {job_name}: {e}")
+                    self.logger.warning(
+                        f"Failed to read watermark for job {job_name} "
+                        f"(lookback {watermark_lookback_days} days): {e}"
+                    )
                     job_watermarks[job_name] = None
             
             state.job_watermarks = job_watermarks
