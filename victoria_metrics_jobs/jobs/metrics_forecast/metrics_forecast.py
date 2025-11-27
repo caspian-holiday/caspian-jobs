@@ -853,21 +853,23 @@ class MetricsForecastJob(BaseJob):
             label_pairs = [f'{k}="{v}"' for k, v in sorted(labels.items())]
             query = f'{metric_name}{{{",".join(label_pairs)}}}'
             
-            # Query each date individually to avoid massive queries
+            # Query each date individually using PromQL to get latest timestamp efficiently
             for forecast_date in forecast_dates:
                 start_dt = datetime.combine(forecast_date, datetime.min.time()).replace(tzinfo=timezone.utc)
                 end_dt = datetime.combine(forecast_date, datetime.max.time()).replace(tzinfo=timezone.utc)
                 
                 try:
-                    # Use 1m step per day (manageable: ~1440 points per day)
-                    query_result = prom.custom_query_range(
-                        query=query,
-                        start_time=start_dt,
-                        end_time=end_dt,
-                        step="1m",
-                    )
+                    # Use last_over_time() PromQL function with instant query at end of day
+                    # This efficiently gets the last sample without fetching all points
+                    # Query the entire day range: last_over_time looks back from end of day
+                    day_duration_seconds = int((end_dt - start_dt).total_seconds()) + 1
+                    range_query = f'last_over_time({query}[{day_duration_seconds}s]) @ {int(end_dt.timestamp())}'
                     
-                    # Parse results to find max timestamp for this date
+                    # Use instant query - the @ timestamp makes it evaluate at end of that day
+                    query_result = prom.custom_query(query=range_query)
+                    
+                    # Parse results to get the timestamp
+                    # Instant query returns list of results with format: {"metric": {...}, "value": [timestamp, value]}
                     if isinstance(query_result, dict):
                         data = query_result.get("data", {})
                         results = data.get("result", [])
@@ -875,13 +877,17 @@ class MetricsForecastJob(BaseJob):
                         results = query_result or []
                     
                     max_ts = None
-                    for series in results:
-                        for value_pair in series.get("values", []):
-                            if not isinstance(value_pair, (list, tuple)) or not value_pair:
-                                continue
-                            ts_value = int(float(value_pair[0]))
-                            if max_ts is None or ts_value > max_ts:
-                                max_ts = ts_value
+                    for result in results:
+                        if isinstance(result, dict):
+                            # Result format: {"metric": {...}, "value": [timestamp, value]}
+                            value_data = result.get("value")
+                            if value_data and isinstance(value_data, (list, tuple)) and len(value_data) >= 1:
+                                ts_value = int(float(value_data[0]))
+                                # Verify timestamp is within the forecast date
+                                ts_dt = datetime.fromtimestamp(ts_value, tz=timezone.utc)
+                                if ts_dt.date() == forecast_date:
+                                    if max_ts is None or ts_value > max_ts:
+                                        max_ts = ts_value
                     
                     if max_ts is not None:
                         timestamp_map[(forecast_date, forecast_type_name)] = max_ts
