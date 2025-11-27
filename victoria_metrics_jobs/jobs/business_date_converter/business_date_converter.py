@@ -5,6 +5,7 @@ Business Date Converter Job - Converts metrics with biz_date labels to timestamp
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
@@ -444,9 +445,9 @@ class BusinessDateConverterJob(BaseJob):
             start_timestamp = int(start_datetime.timestamp())
             end_timestamp = int(end_datetime.timestamp())
             
-            # Query the converted series using range query to get all data points for the day
-            max_existing_timestamp = self._query_max_timestamp_from_converted_series(
-                state, converted_metric_query, start_timestamp, end_timestamp
+            # Query the converted series using export API to get all data points for the day
+            max_existing_timestamp = self._query_export_max_timestamp(
+                state, prom, converted_metric_query, start_datetime, end_datetime, business_date
             )
             
             # Calculate timestamp
@@ -467,60 +468,106 @@ class BusinessDateConverterJob(BaseJob):
             midnight = datetime.combine(business_date, datetime.min.time()).replace(tzinfo=timezone.utc)
             return int(midnight.timestamp())
     
-    def _query_max_timestamp_from_converted_series(
-        self, state: BusinessDateConverterState, metric_query: str, start_timestamp: int, end_timestamp: int
+    def _query_export_max_timestamp(
+        self,
+        state: BusinessDateConverterState,
+        prom: PrometheusConnect,
+        query: str,
+        start_dt: datetime,
+        end_dt: datetime,
+        business_date: date,
     ) -> Optional[int]:
-        """Query the converted series using range query and return the max timestamp.
+        """Query VictoriaMetrics /api/v1/export endpoint to get raw data points with actual timestamps.
+        
+        The export endpoint returns actual data points without step sampling, allowing us to
+        find the real max timestamp of written data points.
         
         Args:
             state: Job state with VM configuration
-            metric_query: PromQL query for the converted metric series
-            start_timestamp: Start timestamp for the range query (Unix timestamp)
-            end_timestamp: End timestamp for the range query (Unix timestamp)
+            prom: Prometheus client (used to get session)
+            query: PromQL query string (metric with labels)
+            start_dt: Start datetime for the query
+            end_dt: End datetime for the query
+            business_date: Business date to filter results
             
         Returns:
-            Max timestamp found in the range, or None if no data exists
+            Max timestamp found, or None if no data exists
         """
         try:
             if not state.vm_query_url:
                 return None
             
-            # Initialize Prometheus client using helper method
-            prom = self._get_prometheus_client(state)
+            # Get session from Prometheus client
+            session = prom._session
             
-            # Convert timestamps to datetime objects for custom_query_range
-            start_time = datetime.fromtimestamp(start_timestamp, tz=timezone.utc)
-            end_time = datetime.fromtimestamp(end_timestamp, tz=timezone.utc)
+            # Build export API URL
+            # Extract base URL (remove /api/v1 if present)
+            base_url = state.vm_query_url.rstrip("/")
+            if base_url.endswith("/api/v1"):
+                base_url = base_url[:-7]
+            elif base_url.endswith("/api"):
+                base_url = base_url[:-4]
             
-            # Execute range query using Prometheus client API
-            # Use 1 minute step for day queries to avoid too many data points
-            # This is sufficient to find the max timestamp while keeping query size reasonable
-            query_result = prom.custom_query_range(
-                query=metric_query,
-                start_time=start_time,
-                end_time=end_time,
-                step='1m'  # 1 minute step - sufficient for finding max timestamp
+            # Prepare headers
+            headers = {}
+            if state.vm_token:
+                headers["Authorization"] = f"Bearer {state.vm_token}"
+            
+            # Build export query parameters
+            # The export endpoint uses match[] parameter for metric selector
+            params = {
+                "match[]": query,
+                "start": int(start_dt.timestamp()),
+                "end": int(end_dt.timestamp()),
+            }
+            
+            # Make GET request to export endpoint
+            response = session.get(
+                f"{base_url}/api/v1/export",
+                params=params,
+                headers=headers,
+                timeout=30,
             )
+            response.raise_for_status()
             
-            # Parse response to find max timestamp
-            max_timestamp = None
-            if query_result and isinstance(query_result, dict):
-                if query_result.get('status') == 'success' and 'data' in query_result:
-                    data = query_result['data']
-                    if 'result' in data and isinstance(data['result'], list):
-                        for series in data['result']:
-                            if 'values' in series and isinstance(series['values'], list):
-                                for value_pair in series['values']:
-                                    if isinstance(value_pair, list) and len(value_pair) >= 1:
-                                        # value_pair format: [timestamp, value]
-                                        timestamp = float(value_pair[0])
-                                        if max_timestamp is None or timestamp > max_timestamp:
-                                            max_timestamp = int(timestamp)
+            # Parse export response
+            # Export format: newline-delimited JSON
+            # Each line: {"metric": {...}, "values": [value1, value2, ...], "timestamps": [timestamp1_ms, timestamp2_ms, ...]}
+            # Values and timestamps are separate arrays, aligned by index
+            max_ts = None
+            content = response.text
             
-            return max_timestamp
+            # Parse newline-delimited JSON format
+            for line in content.strip().split("\n"):
+                if not line.strip():
+                    continue
+                try:
+                    data_point = json.loads(line)
+                    
+                    # Export format: {"metric": {...}, "values": [...], "timestamps": [...]}
+                    timestamps = data_point.get("timestamps", [])
+                    
+                    # Process timestamps array (values are not needed for timestamp lookup)
+                    for timestamp_ms_raw in timestamps:
+                        timestamp_ms = float(timestamp_ms_raw)
+                        timestamp = int(timestamp_ms / 1000)  # Convert from milliseconds to seconds
+                        
+                        ts_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                        if ts_dt.date() == business_date:
+                            if max_ts is None or timestamp > max_ts:
+                                max_ts = timestamp
+                                
+                except (json.JSONDecodeError, ValueError, KeyError, TypeError, IndexError):
+                    # Skip invalid lines
+                    continue
             
-        except Exception as e:
-            self.logger.warning(f"Failed to query max timestamp from converted series: {e}")
+            return max_ts
+            
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to query export endpoint for timestamp lookup: %s",
+                exc,
+            )
             return None
     
     def _get_prometheus_client(self, state: BusinessDateConverterState) -> PrometheusConnect:
