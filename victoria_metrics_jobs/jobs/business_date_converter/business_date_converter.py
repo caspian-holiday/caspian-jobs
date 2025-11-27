@@ -305,10 +305,18 @@ class BusinessDateConverterJob(BaseJob):
                     
                     # Store the max timestamp from all input timeseries for watermark
                     # This represents the latest timestamp seen on any input timeseries
+                    # Only set if we actually found input data; clear if no data found
                     if max_timestamp_from_inputs is not None:
                         state.max_processed_timestamps[job_name] = max_timestamp_from_inputs
                         self.logger.info(
                             f"Latest timestamp from all input timeseries for {job_name}: {max_timestamp_from_inputs}"
+                        )
+                    else:
+                        # Clear any previous value to prevent watermark update when no input found
+                        state.max_processed_timestamps.pop(job_name, None)
+                        self.logger.info(
+                            f"No input data found for job {job_name}, "
+                            "cleared max_processed_timestamps to prevent watermark update"
                         )
                     
                     # Convert each metric
