@@ -437,6 +437,7 @@ class MetricsForecastJob(BaseJob):
                     future_df = pd.DataFrame({"ds": future_dates})
                     forecast_df = model.predict(future_df)
 
+                    publish_rows: List[Dict[str, Any]] = []
                     for future_row in forecast_df.itertuples():
                         forecast_date = future_row.ds.date()
                         for forecast_type in state.forecast_types:
@@ -454,12 +455,21 @@ class MetricsForecastJob(BaseJob):
                             timestamp = self._calculate_forecast_timestamp(
                                 state, prom, series.metric_name, labels, forecast_date
                             )
-                            metric_line = self._build_metric_line(
-                                series.metric_name, labels, float(value), timestamp
+                            publish_rows.append(
+                                {
+                                    "metric_name": series.metric_name,
+                                    "labels": labels,
+                                    "value": float(value),
+                                    "timestamp": timestamp,
+                                }
                             )
 
-                            if self._write_metric_to_vm(state, metric_line, timeout=60):
-                                state.forecasts_written += 1
+                    if publish_rows:
+                        forecast_batch_df = pd.DataFrame(publish_rows)
+                        if self._write_metrics_dataframe_to_vm(
+                            state, forecast_batch_df, timeout=60
+                        ):
+                            state.forecasts_written += len(forecast_batch_df)
 
                     state.series_processed += 1
                     
@@ -698,7 +708,39 @@ class MetricsForecastJob(BaseJob):
     def _write_metric_to_vm(
         self, state: MetricsForecastState, metric_line: str, timeout: int = 60
     ) -> bool:
+        return self._post_payload_to_vm(
+            state, metric_line, timeout=timeout, context="metric"
+        )
+
+    def _write_metrics_dataframe_to_vm(
+        self, state: MetricsForecastState, dataframe: pd.DataFrame, timeout: int = 60
+    ) -> bool:
+        """Publish a pandas DataFrame of forecast rows in a single VM import."""
+        if dataframe is None or dataframe.empty:
+            return True
+
+        metric_lines: List[str] = []
+        for row in dataframe.itertuples(index=False):
+            metric_lines.append(
+                self._build_metric_line(
+                    getattr(row, "metric_name"),
+                    getattr(row, "labels"),
+                    float(getattr(row, "value")),
+                    int(getattr(row, "timestamp")),
+                )
+            )
+
+        payload = "\n".join(metric_lines)
+        return self._post_payload_to_vm(
+            state, payload, timeout=timeout, context="forecast batch"
+        )
+
+    def _post_payload_to_vm(
+        self, state: MetricsForecastState, payload: str, timeout: int, context: str
+    ) -> bool:
         try:
+            if not payload:
+                return False
             if not state.vm_gateway_url:
                 self.logger.error("VM gateway URL not configured")
                 return False
@@ -706,7 +748,6 @@ class MetricsForecastJob(BaseJob):
             if prom is None:
                 return False
 
-            # prometheus-api-client 0.6.0 stores session as _session (private attribute)
             session = prom._session
 
             headers = {"Content-Type": "text/plain"}
@@ -714,14 +755,14 @@ class MetricsForecastJob(BaseJob):
                 headers["Authorization"] = f"Bearer {state.vm_token}"
             response = session.post(
                 f"{state.vm_gateway_url}/api/v1/import/prometheus",
-                data=metric_line,
+                data=payload,
                 headers=headers,
                 timeout=timeout,
             )
             response.raise_for_status()
             return True
         except Exception as exc:
-            self.logger.error("Failed to write metric to VM: %s", exc)
+            self.logger.error("Failed to write %s to VM: %s", context, exc)
             return False
 
     def _calculate_forecast_timestamp(
