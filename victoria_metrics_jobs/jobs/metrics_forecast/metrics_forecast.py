@@ -450,6 +450,22 @@ class MetricsForecastJob(BaseJob):
                         state.forecast_types,
                         unique_forecast_dates,
                     )
+                    
+                    # Log timestamp map contents for debugging
+                    self.logger.debug(
+                        "Timestamp map for %s: %s entries",
+                        series.metric_name,
+                        len([v for v in timestamp_map.values() if v is not None]),
+                    )
+                    for (fd, ft), ts in timestamp_map.items():
+                        if ts is not None:
+                            self.logger.debug(
+                                "  %s/%s on %s: existing_ts=%s",
+                                series.metric_name,
+                                ft,
+                                fd,
+                                ts,
+                            )
 
                     publish_rows: List[Dict[str, Any]] = []
                     for future_row in forecast_df.itertuples():
@@ -853,41 +869,35 @@ class MetricsForecastJob(BaseJob):
             label_pairs = [f'{k}="{v}"' for k, v in sorted(labels.items())]
             query = f'{metric_name}{{{",".join(label_pairs)}}}'
             
-            # Query each date individually using PromQL to get latest timestamp efficiently
+            # Query each date individually to get max timestamp (same approach as business_date_converter)
             for forecast_date in forecast_dates:
                 start_dt = datetime.combine(forecast_date, datetime.min.time()).replace(tzinfo=timezone.utc)
                 end_dt = datetime.combine(forecast_date, datetime.max.time()).replace(tzinfo=timezone.utc)
                 
                 try:
-                    # Use last_over_time() PromQL function with instant query at end of day
-                    # This efficiently gets the last sample without fetching all points
-                    # Query the entire day range: last_over_time looks back from end of day
-                    day_duration_seconds = int((end_dt - start_dt).total_seconds()) + 1
-                    range_query = f'last_over_time({query}[{day_duration_seconds}s]) @ {int(end_dt.timestamp())}'
+                    # Query the entire day with 1m step to find max timestamp
+                    # This is manageable (~1440 points per day) and ensures we find all timestamps
+                    query_result = prom.custom_query_range(
+                        query=query,
+                        start_time=start_dt,
+                        end_time=end_dt,
+                        step="1m",
+                    )
                     
-                    # Use instant query - the @ timestamp makes it evaluate at end of that day
-                    query_result = prom.custom_query(query=range_query)
-                    
-                    # Parse results to get the timestamp
-                    # Instant query returns list of results with format: {"metric": {...}, "value": [timestamp, value]}
-                    if isinstance(query_result, dict):
-                        data = query_result.get("data", {})
-                        results = data.get("result", [])
-                    else:
-                        results = query_result or []
-                    
+                    # Parse response to find max timestamp (same structure as business_date_converter)
                     max_ts = None
-                    for result in results:
-                        if isinstance(result, dict):
-                            # Result format: {"metric": {...}, "value": [timestamp, value]}
-                            value_data = result.get("value")
-                            if value_data and isinstance(value_data, (list, tuple)) and len(value_data) >= 1:
-                                ts_value = int(float(value_data[0]))
-                                # Verify timestamp is within the forecast date
-                                ts_dt = datetime.fromtimestamp(ts_value, tz=timezone.utc)
-                                if ts_dt.date() == forecast_date:
-                                    if max_ts is None or ts_value > max_ts:
-                                        max_ts = ts_value
+                    if query_result and isinstance(query_result, dict):
+                        if query_result.get("status") == "success" and "data" in query_result:
+                            data = query_result["data"]
+                            if "result" in data and isinstance(data["result"], list):
+                                for series in data["result"]:
+                                    if "values" in series and isinstance(series["values"], list):
+                                        for value_pair in series["values"]:
+                                            if isinstance(value_pair, list) and len(value_pair) >= 1:
+                                                # value_pair format: [timestamp, value]
+                                                timestamp = float(value_pair[0])
+                                                if max_ts is None or timestamp > max_ts:
+                                                    max_ts = int(timestamp)
                     
                     if max_ts is not None:
                         timestamp_map[(forecast_date, forecast_type_name)] = max_ts
