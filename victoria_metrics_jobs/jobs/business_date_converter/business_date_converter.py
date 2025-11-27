@@ -299,9 +299,17 @@ class BusinessDateConverterJob(BaseJob):
                     
                     # Query metrics using PromQL with grouping to get latest value per series+business_date
                     # This is more efficient than fetching all data points and grouping locally
-                    grouped_metrics = self._query_grouped_metrics(prom, job_name, start_time, end_time)
+                    grouped_metrics, max_timestamp_from_inputs = self._query_grouped_metrics(prom, job_name, start_time, end_time)
                     
                     self.logger.info(f"Found {len(grouped_metrics)} unique metric series+business_date combinations for job {job_name}")
+                    
+                    # Store the max timestamp from all input timeseries for watermark
+                    # This represents the latest timestamp seen on any input timeseries
+                    if max_timestamp_from_inputs is not None:
+                        state.max_processed_timestamps[job_name] = max_timestamp_from_inputs
+                        self.logger.info(
+                            f"Latest timestamp from all input timeseries for {job_name}: {max_timestamp_from_inputs}"
+                        )
                     
                     # Convert each metric
                     for (metric_name, labels_tuple, biz_date_str), (value, original_timestamp) in grouped_metrics.items():
@@ -316,14 +324,8 @@ class BusinessDateConverterJob(BaseJob):
                                 self.logger.warning(f"Invalid biz_date format: {biz_date_str}, expected dd/mm/yyyy")
                                 continue
                             
-                            # Track max timestamp for this job
-                            if job_name not in state.max_processed_timestamps:
-                                state.max_processed_timestamps[job_name] = int(original_timestamp)
-                            else:
-                                state.max_processed_timestamps[job_name] = max(
-                                    state.max_processed_timestamps[job_name],
-                                    int(original_timestamp)
-                                )
+                            # Note: max_timestamp is already tracked in _query_grouped_metrics
+                            # and stored in state.max_processed_timestamps above
                             
                             # Calculate converted timestamp
                             converted_ts = self._calculate_converted_timestamp(
@@ -361,16 +363,20 @@ class BusinessDateConverterJob(BaseJob):
     
     def _query_grouped_metrics(
         self, prom: PrometheusConnect, job_name: str, start_time: datetime, end_time: datetime
-    ) -> Dict[Tuple[str, tuple, str], Tuple[float, float]]:
+    ) -> Tuple[Dict[Tuple[str, tuple, str], Tuple[float, float]], Optional[int]]:
         """Query metrics from VM with server-side grouping to get latest value per series+business_date.
         
         Uses PromQL last_over_time() to get the latest value per metric series and business_date.
         This is much more efficient than fetching all data points and grouping locally.
         
-        Returns dict: {(metric_name, labels_tuple, biz_date_str): (value, timestamp)}
-        where labels_tuple is tuple(sorted(labels.items())) for hashability
+        Returns:
+            Tuple of:
+            - dict: {(metric_name, labels_tuple, biz_date_str): (value, timestamp)}
+              where labels_tuple is tuple(sorted(labels.items())) for hashability
+            - max_timestamp: Maximum timestamp seen across all input timeseries (for watermark)
         """
         grouped = {}
+        max_timestamp = None
         
         try:
             # Calculate time range in seconds for PromQL
@@ -381,7 +387,7 @@ class BusinessDateConverterJob(BaseJob):
             # Ensure we have a positive time range
             if time_range_seconds <= 0:
                 self.logger.warning(f"Invalid time range: start_time={start_time}, end_time={end_time}")
-                return {}
+                return {}, None
             
             # Query all metrics with job label using last_over_time to get latest value per series
             # This efficiently groups server-side and returns only the latest value per series+biz_date
@@ -417,6 +423,10 @@ class BusinessDateConverterJob(BaseJob):
                         timestamp = float(value_data[0])
                         value = float(value_data[1])
                         
+                        # Track max timestamp seen across all input timeseries
+                        if max_timestamp is None or timestamp > max_timestamp:
+                            max_timestamp = timestamp
+                        
                         # Create key: (metric_name, labels_without_biz_date, biz_date)
                         # Convert labels dict to tuple of sorted items for hashability
                         labels_tuple = tuple(sorted(labels.items()))
@@ -435,7 +445,7 @@ class BusinessDateConverterJob(BaseJob):
             self.logger.error(f"Failed to query grouped metrics: {e}")
             # Return empty dict on error
         
-        return grouped
+        return grouped, int(max_timestamp) if max_timestamp is not None else None
     
     def _calculate_converted_timestamp(
         self, state: BusinessDateConverterState, prom: PrometheusConnect,
