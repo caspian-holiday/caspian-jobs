@@ -835,63 +835,33 @@ class MetricsForecastJob(BaseJob):
                 end_dt = datetime.combine(forecast_date, datetime.max.time()).replace(tzinfo=timezone.utc)
                 
                 try:
-                    # Query the last hour of the day with 1s step to get actual data point timestamps
-                    # Range queries with steps return sampled values at step boundaries, not real timestamps
-                    # By querying the last hour with 1s step, we get the actual timestamps of written data points
-                    # This is manageable (~3600 points) and ensures we find the real max timestamp
-                    last_hour_start = end_dt - timedelta(hours=1)
+                    # Use tlast_over_time() to get the actual timestamp of the last data point
+                    # This avoids step sampling and returns the real timestamp of the written data
+                    # Query at end of day to get last sample within that day
+                    day_duration_seconds = int((end_dt - start_dt).total_seconds()) + 1
+                    tlast_query = f'tlast_over_time({query}[{day_duration_seconds}s])'
                     
-                    query_result = prom.custom_query_range(
-                        query=query,
-                        start_time=last_hour_start,
-                        end_time=end_dt,
-                        step="1s",
-                    )
+                    # Execute instant query at end of day to get last timestamp
+                    query_result = prom.custom_query(query=tlast_query)
                     
-                    # Parse response to find max timestamp
-                    # custom_query_range returns a list of series results
+                    # Parse instant query response to get timestamp
+                    # custom_query returns a list of results
+                    # tlast_over_time() returns the timestamp as the value: [evaluation_time, actual_timestamp]
                     max_ts = None
                     
-                    if not query_result or not isinstance(query_result, list):
-                        # Unexpected format, skip
-                        continue
-                    
-                    # Extract actual timestamps from results
-                    # Only consider timestamps that are actual data points (not step boundaries)
-                    for series_result in query_result:
-                        if isinstance(series_result, dict) and "values" in series_result:
-                            values = series_result.get("values", [])
-                            for value_pair in values:
-                                if isinstance(value_pair, (list, tuple)) and len(value_pair) >= 1:
-                                    # value_pair format: [timestamp, value]
-                                    timestamp = float(value_pair[0])
-                                    ts_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-                                    # Only consider timestamps within the forecast date
+                    if query_result and isinstance(query_result, list):
+                        for result in query_result:
+                            if isinstance(result, dict):
+                                # Instant query format: {"metric": {...}, "value": [evaluation_timestamp, result_value]}
+                                # For tlast_over_time(), result_value is the actual timestamp of the last data point
+                                value_data = result.get("value")
+                                if value_data and isinstance(value_data, (list, tuple)) and len(value_data) >= 2:
+                                    # value_data[1] is the timestamp returned by tlast_over_time()
+                                    timestamp_value = float(value_data[1])
+                                    ts_dt = datetime.fromtimestamp(timestamp_value, tz=timezone.utc)
+                                    # Verify timestamp is within the forecast date
                                     if ts_dt.date() == forecast_date:
-                                        if max_ts is None or timestamp > max_ts:
-                                            max_ts = int(timestamp)
-                    
-                    # If no data found in last hour, try querying the entire day with 1h step as fallback
-                    # This will still give us sampled values, but better than nothing
-                    if max_ts is None:
-                        query_result_fallback = prom.custom_query_range(
-                            query=query,
-                            start_time=start_dt,
-                            end_time=end_dt,
-                            step="1h",
-                        )
-                        
-                        if query_result_fallback and isinstance(query_result_fallback, list):
-                            for series_result in query_result_fallback:
-                                if isinstance(series_result, dict) and "values" in series_result:
-                                    values = series_result.get("values", [])
-                                    for value_pair in values:
-                                        if isinstance(value_pair, (list, tuple)) and len(value_pair) >= 1:
-                                            timestamp = float(value_pair[0])
-                                            ts_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-                                            if ts_dt.date() == forecast_date:
-                                                if max_ts is None or timestamp > max_ts:
-                                                    max_ts = int(timestamp)
+                                        max_ts = int(timestamp_value)
                     
                     if max_ts is not None:
                         timestamp_map[(forecast_date, forecast_type_name)] = max_ts
