@@ -814,8 +814,8 @@ class MetricsForecastJob(BaseJob):
     ) -> Dict[Tuple[date, str], Optional[int]]:
         """Batch lookup existing forecast timestamps for all forecast dates and types.
         
-        Queries VictoriaMetrics once per forecast_type for the entire date range,
-        then returns a map of (forecast_date, forecast_type_name) -> max_timestamp.
+        Queries VictoriaMetrics per date per forecast_type to avoid overwhelming VM
+        with large range queries. Returns a map of (forecast_date, forecast_type_name) -> max_timestamp.
         
         Args:
             state: Job state object
@@ -831,12 +831,6 @@ class MetricsForecastJob(BaseJob):
         if not forecast_dates:
             return {}
         
-        # Calculate date range for query (start of first date to end of last date)
-        min_date = min(forecast_dates)
-        max_date = max(forecast_dates)
-        start_dt = datetime.combine(min_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-        end_dt = datetime.combine(max_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-        
         # Initialize result map with None for all combinations
         timestamp_map: Dict[Tuple[date, str], Optional[int]] = {}
         for forecast_date in forecast_dates:
@@ -845,10 +839,8 @@ class MetricsForecastJob(BaseJob):
                 if forecast_type_name:
                     timestamp_map[(forecast_date, forecast_type_name)] = None
         
-        # Convert to set for faster lookup
-        forecast_dates_set = set(forecast_dates)
-        
-        # Query once per forecast_type for the entire date range
+        # Query per date per forecast_type to avoid overwhelming VM with large range queries
+        # This is still batched compared to per-point queries
         for forecast_type in forecast_types:
             forecast_type_name = forecast_type.get("name")
             if not forecast_type_name:
@@ -861,78 +853,44 @@ class MetricsForecastJob(BaseJob):
             label_pairs = [f'{k}="{v}"' for k, v in sorted(labels.items())]
             query = f'{metric_name}{{{",".join(label_pairs)}}}'
             
-            self.logger.debug(
-                "Batch lookup query for %s/%s: %s (range: %s to %s)",
-                metric_name,
-                forecast_type_name,
-                query,
-                start_dt,
-                end_dt,
-            )
-            
-            try:
-                # Use 1m step to ensure we don't miss timestamps between intervals
-                query_result = prom.custom_query_range(
-                    query=query,
-                    start_time=start_dt,
-                    end_time=end_dt,
-                    step="1m",
-                )
+            # Query each date individually to avoid massive queries
+            for forecast_date in forecast_dates:
+                start_dt = datetime.combine(forecast_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+                end_dt = datetime.combine(forecast_date, datetime.max.time()).replace(tzinfo=timezone.utc)
                 
-                # Parse results to find max timestamp per date
-                if isinstance(query_result, dict):
-                    data = query_result.get("data", {})
-                    results = data.get("result", [])
-                else:
-                    results = query_result or []
-                
-                # Track max timestamp per date for this forecast type
-                date_max_ts: Dict[date, int] = {}
-                
-                self.logger.debug(
-                    "Batch lookup returned %s series for %s/%s",
-                    len(results),
-                    metric_name,
-                    forecast_type_name,
-                )
-                
-                for series in results:
-                    values = series.get("values", [])
-                    self.logger.debug(
-                        "Processing series with %s value pairs for %s/%s",
-                        len(values),
-                        metric_name,
-                        forecast_type_name,
+                try:
+                    # Use 1m step per day (manageable: ~1440 points per day)
+                    query_result = prom.custom_query_range(
+                        query=query,
+                        start_time=start_dt,
+                        end_time=end_dt,
+                        step="1m",
                     )
-                    for value_pair in values:
-                        if not isinstance(value_pair, (list, tuple)) or not value_pair:
-                            continue
-                        ts_value = int(float(value_pair[0]))
-                        ts_dt = datetime.fromtimestamp(ts_value, tz=timezone.utc)
-                        ts_date = ts_dt.date()
-                        
-                        # Only consider timestamps for dates in our forecast range
-                        if ts_date in forecast_dates_set:
-                            if ts_date not in date_max_ts or ts_value > date_max_ts[ts_date]:
-                                date_max_ts[ts_date] = ts_value
-                                self.logger.debug(
-                                    "Updated max_ts for %s/%s on %s: %s",
-                                    metric_name,
-                                    forecast_type_name,
-                                    ts_date,
-                                    ts_value,
-                                )
-                
-                # Update timestamp map with found max timestamps
-                for forecast_date in forecast_dates:
-                    if forecast_date in date_max_ts:
-                        timestamp_map[(forecast_date, forecast_type_name)] = date_max_ts[forecast_date]
+                    
+                    # Parse results to find max timestamp for this date
+                    if isinstance(query_result, dict):
+                        data = query_result.get("data", {})
+                        results = data.get("result", [])
+                    else:
+                        results = query_result or []
+                    
+                    max_ts = None
+                    for series in results:
+                        for value_pair in series.get("values", []):
+                            if not isinstance(value_pair, (list, tuple)) or not value_pair:
+                                continue
+                            ts_value = int(float(value_pair[0]))
+                            if max_ts is None or ts_value > max_ts:
+                                max_ts = ts_value
+                    
+                    if max_ts is not None:
+                        timestamp_map[(forecast_date, forecast_type_name)] = max_ts
                         self.logger.debug(
                             "Found existing forecast for %s/%s on %s with max_ts=%s",
                             metric_name,
                             forecast_type_name,
                             forecast_date,
-                            date_max_ts[forecast_date],
+                            max_ts,
                         )
                     else:
                         self.logger.debug(
@@ -942,13 +900,15 @@ class MetricsForecastJob(BaseJob):
                             forecast_date,
                         )
                         
-            except Exception as exc:
-                self.logger.warning(
-                    "Failed to batch lookup timestamps for forecast_type=%s: %s",
-                    forecast_type_name,
-                    exc,
-                )
-                # Continue with other forecast types even if one fails
+                except Exception as exc:
+                    self.logger.warning(
+                        "Failed to lookup timestamp for %s/%s on %s: %s",
+                        metric_name,
+                        forecast_type_name,
+                        forecast_date,
+                        exc,
+                    )
+                    # Continue with other dates even if one fails
         
         return timestamp_map
 
