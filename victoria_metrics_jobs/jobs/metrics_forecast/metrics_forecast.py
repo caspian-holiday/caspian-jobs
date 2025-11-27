@@ -470,13 +470,28 @@ class MetricsForecastJob(BaseJob):
                             existing_max_ts = timestamp_map.get((forecast_date, name))
                             
                             if existing_max_ts is not None:
-                                # Increment by 1 second for deterministic overwriting
+                                # Increment by 1 minute for deterministic overwriting (matches query step)
                                 end_dt = datetime.combine(forecast_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-                                timestamp = min(existing_max_ts + 1, int(end_dt.timestamp()))
+                                timestamp = min(existing_max_ts + 60, int(end_dt.timestamp()))
+                                self.logger.debug(
+                                    "Using incremented timestamp for %s/%s on %s: %s -> %s",
+                                    series.metric_name,
+                                    name,
+                                    forecast_date,
+                                    existing_max_ts,
+                                    timestamp,
+                                )
                             else:
                                 # No existing forecast, use midnight timestamp
                                 start_dt = datetime.combine(forecast_date, datetime.min.time()).replace(tzinfo=timezone.utc)
                                 timestamp = int(start_dt.timestamp())
+                                self.logger.debug(
+                                    "No existing forecast found for %s/%s on %s, using midnight timestamp: %s",
+                                    series.metric_name,
+                                    name,
+                                    forecast_date,
+                                    timestamp,
+                                )
                             
                             publish_rows.append(
                                 {
@@ -830,6 +845,9 @@ class MetricsForecastJob(BaseJob):
                 if forecast_type_name:
                     timestamp_map[(forecast_date, forecast_type_name)] = None
         
+        # Convert to set for faster lookup
+        forecast_dates_set = set(forecast_dates)
+        
         # Query once per forecast_type for the entire date range
         for forecast_type in forecast_types:
             forecast_type_name = forecast_type.get("name")
@@ -843,12 +861,22 @@ class MetricsForecastJob(BaseJob):
             label_pairs = [f'{k}="{v}"' for k, v in sorted(labels.items())]
             query = f'{metric_name}{{{",".join(label_pairs)}}}'
             
+            self.logger.debug(
+                "Batch lookup query for %s/%s: %s (range: %s to %s)",
+                metric_name,
+                forecast_type_name,
+                query,
+                start_dt,
+                end_dt,
+            )
+            
             try:
+                # Use 1m step to ensure we don't miss timestamps between intervals
                 query_result = prom.custom_query_range(
                     query=query,
                     start_time=start_dt,
                     end_time=end_dt,
-                    step="1s",
+                    step="1m",
                 )
                 
                 # Parse results to find max timestamp per date
@@ -861,8 +889,22 @@ class MetricsForecastJob(BaseJob):
                 # Track max timestamp per date for this forecast type
                 date_max_ts: Dict[date, int] = {}
                 
+                self.logger.debug(
+                    "Batch lookup returned %s series for %s/%s",
+                    len(results),
+                    metric_name,
+                    forecast_type_name,
+                )
+                
                 for series in results:
-                    for value_pair in series.get("values", []):
+                    values = series.get("values", [])
+                    self.logger.debug(
+                        "Processing series with %s value pairs for %s/%s",
+                        len(values),
+                        metric_name,
+                        forecast_type_name,
+                    )
+                    for value_pair in values:
                         if not isinstance(value_pair, (list, tuple)) or not value_pair:
                             continue
                         ts_value = int(float(value_pair[0]))
@@ -870,14 +912,35 @@ class MetricsForecastJob(BaseJob):
                         ts_date = ts_dt.date()
                         
                         # Only consider timestamps for dates in our forecast range
-                        if ts_date in forecast_dates:
+                        if ts_date in forecast_dates_set:
                             if ts_date not in date_max_ts or ts_value > date_max_ts[ts_date]:
                                 date_max_ts[ts_date] = ts_value
+                                self.logger.debug(
+                                    "Updated max_ts for %s/%s on %s: %s",
+                                    metric_name,
+                                    forecast_type_name,
+                                    ts_date,
+                                    ts_value,
+                                )
                 
                 # Update timestamp map with found max timestamps
                 for forecast_date in forecast_dates:
                     if forecast_date in date_max_ts:
                         timestamp_map[(forecast_date, forecast_type_name)] = date_max_ts[forecast_date]
+                        self.logger.debug(
+                            "Found existing forecast for %s/%s on %s with max_ts=%s",
+                            metric_name,
+                            forecast_type_name,
+                            forecast_date,
+                            date_max_ts[forecast_date],
+                        )
+                    else:
+                        self.logger.debug(
+                            "No existing forecast found for %s/%s on %s",
+                            metric_name,
+                            forecast_type_name,
+                            forecast_date,
+                        )
                         
             except Exception as exc:
                 self.logger.warning(
