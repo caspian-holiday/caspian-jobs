@@ -836,9 +836,8 @@ class MetricsForecastJob(BaseJob):
             
             # Parse export response
             # Export format: newline-delimited JSON
-            # Each line: {"metric": {...}, "values": [[timestamp_ms, value], ...]}
-            # The values array contains arrays where each element is [timestamp_ms, value]
-            # However, if values contains just numbers (not tuples), then timestamps are in a separate "timestamps" field
+            # Each line: {"metric": {...}, "values": [value1, value2, ...], "timestamps": [timestamp1_ms, timestamp2_ms, ...]}
+            # Values and timestamps are separate arrays, aligned by index
             max_ts = None
             content = response.text
             
@@ -849,35 +848,14 @@ class MetricsForecastJob(BaseJob):
                 try:
                     data_point = json.loads(line)
                     
-                    values = data_point.get("values", [])
+                    # Export format: {"metric": {...}, "values": [...], "timestamps": [...]}
                     timestamps = data_point.get("timestamps", [])
                     
-                    # Check if values contains tuples [timestamp_ms, value] or just values
-                    if values and isinstance(values[0], (list, tuple)):
-                        # Format: {"metric": {...}, "values": [[timestamp_ms, value], ...]}
-                        for value_entry in values:
-                            if isinstance(value_entry, (list, tuple)) and len(value_entry) >= 2:
-                                timestamp_ms = float(value_entry[0])
-                                timestamp = int(timestamp_ms / 1000)
-                                
-                                ts_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-                                if ts_dt.date() == forecast_date:
-                                    if max_ts is None or timestamp > max_ts:
-                                        max_ts = timestamp
-                    elif timestamps:
-                        # Format: {"metric": {...}, "values": [value1, value2, ...], "timestamps": [ts1, ts2, ...]}
-                        for timestamp_ms_raw in timestamps:
-                            timestamp_ms = float(timestamp_ms_raw)
-                            timestamp = int(timestamp_ms / 1000)
-                            
-                            ts_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-                            if ts_dt.date() == forecast_date:
-                                if max_ts is None or timestamp > max_ts:
-                                    max_ts = timestamp
-                    elif "timestamp" in data_point:
-                        # Format: {"metric": {...}, "timestamp": timestamp_ms, "value": value} (single data point)
-                        timestamp_ms = float(data_point["timestamp"])
+                    # Process timestamps array (values are not needed for timestamp lookup)
+                    for timestamp_ms_raw in timestamps:
+                        timestamp_ms = float(timestamp_ms_raw)
                         timestamp = int(timestamp_ms / 1000)
+                        
                         ts_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
                         if ts_dt.date() == forecast_date:
                             if max_ts is None or timestamp > max_ts:
