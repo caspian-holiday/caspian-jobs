@@ -6,8 +6,11 @@ business-day forecasts back to Victoria Metrics.
 
 from __future__ import annotations
 
+import gc
+import json
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -280,7 +283,6 @@ class MetricsForecastJob(BaseJob):
                 try:
                     # Add small delay between series to avoid resource contention
                     if series_idx > 0:
-                        import time
                         time.sleep(0.5)  # 500ms delay between series
                     
                     training_df = self._prepare_training_frame(series.samples)
@@ -390,11 +392,9 @@ class MetricsForecastJob(BaseJob):
                                     error_msg[:200],
                                     wait_seconds,
                                 )
-                                import time
                                 time.sleep(wait_seconds)
                                 
                                 # Cleanup before retry
-                                import gc
                                 del model
                                 gc.collect()
                                 time.sleep(0.5)  # Additional small delay for cleanup
@@ -486,9 +486,8 @@ class MetricsForecastJob(BaseJob):
 
                     state.series_processed += 1
                     
-                    # Clean up model to free memory (helps prevent cmdstanpy crashes)
+                    # Clean up model to free memory
                     del model
-                    import gc
                     gc.collect()
 
                 except Exception as series_exc:
@@ -499,8 +498,7 @@ class MetricsForecastJob(BaseJob):
                         series.labels,
                         series_exc,
                     )
-                    # Clean up memory on failure to help prevent cascading crashes
-                    import gc
+                    # Clean up memory on failure
                     gc.collect()
 
             return Ok(state)
@@ -694,10 +692,6 @@ class MetricsForecastJob(BaseJob):
         return future_dates
 
     def _create_prophet_model(self, state: MetricsForecastState) -> Prophet:
-        # Clean up any lingering Stan processes/resources before creating new model
-        import gc
-        gc.collect()
-        
         model = Prophet(**state.prophet_config)
         # Some downstream environments ship Prophet builds that forget to set this attribute.
         if not hasattr(model, "stan_backend"):
@@ -778,6 +772,109 @@ class MetricsForecastJob(BaseJob):
             self.logger.error("Failed to write %s to VM: %s", context, exc)
             return False
 
+    def _query_export_max_timestamp(
+        self,
+        state: MetricsForecastState,
+        prom: PrometheusConnect,
+        query: str,
+        start_dt: datetime,
+        end_dt: datetime,
+        forecast_date: date,
+    ) -> Optional[int]:
+        """Query VictoriaMetrics /api/v1/export endpoint to get raw data points with actual timestamps.
+        
+        The export endpoint returns actual data points without step sampling, allowing us to
+        find the real max timestamp of written data points.
+        
+        Args:
+            state: Job state with VM configuration
+            prom: Prometheus client (used to get session)
+            query: PromQL query string (metric with labels)
+            start_dt: Start datetime for the query
+            end_dt: End datetime for the query
+            forecast_date: Forecast date to filter results
+            
+        Returns:
+            Max timestamp found, or None if no data exists
+        """
+        try:
+            if not state.vm_query_url:
+                return None
+            
+            # Get session from Prometheus client
+            session = prom._session
+            
+            # Build export API URL
+            # Extract base URL (remove /api/v1 if present)
+            base_url = state.vm_query_url.rstrip("/")
+            if base_url.endswith("/api/v1"):
+                base_url = base_url[:-7]
+            elif base_url.endswith("/api"):
+                base_url = base_url[:-4]
+            
+            # Prepare headers
+            headers = {}
+            if state.vm_token:
+                headers["Authorization"] = f"Bearer {state.vm_token}"
+            
+            # Build export query parameters
+            # The export endpoint uses match[] parameter for metric selector
+            params = {
+                "match[]": query,
+                "start": int(start_dt.timestamp()),
+                "end": int(end_dt.timestamp()),
+            }
+            
+            # Make GET request to export endpoint
+            response = session.get(
+                f"{base_url}/api/v1/export",
+                params=params,
+                headers=headers,
+                timeout=30,
+            )
+            response.raise_for_status()
+            
+            # Parse export response
+            # Export format: newline-delimited JSON
+            # Each line: {"metric": {...}, "values": [[timestamp_ms, value], ...]}
+            # Timestamps in export are in milliseconds
+            max_ts = None
+            content = response.text
+            
+            # Parse newline-delimited JSON format
+            for line in content.strip().split("\n"):
+                if not line.strip():
+                    continue
+                try:
+                    data_point = json.loads(line)
+                    
+                    # Export format: {"metric": {...}, "values": [[timestamp_ms, value], ...]}
+                    # VictoriaMetrics export uses milliseconds for timestamps
+                    values = data_point.get("values", [])
+                    for value_pair in values:
+                        if isinstance(value_pair, (list, tuple)) and len(value_pair) >= 1:
+                            # Timestamp is in milliseconds, convert to seconds
+                            timestamp_ms = float(value_pair[0])
+                            timestamp = int(timestamp_ms / 1000)
+                            
+                            ts_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                            # Verify timestamp is within the forecast date
+                            if ts_dt.date() == forecast_date:
+                                if max_ts is None or timestamp > max_ts:
+                                    max_ts = timestamp
+                except (json.JSONDecodeError, ValueError, KeyError):
+                    # Skip invalid lines
+                    continue
+            
+            return max_ts
+            
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to query export endpoint for timestamp lookup: %s",
+                exc,
+            )
+            return None
+
     def _batch_lookup_forecast_timestamps(
         self,
         state: MetricsForecastState,
@@ -835,33 +932,11 @@ class MetricsForecastJob(BaseJob):
                 end_dt = datetime.combine(forecast_date, datetime.max.time()).replace(tzinfo=timezone.utc)
                 
                 try:
-                    # Use tlast_over_time() to get the actual timestamp of the last data point
-                    # This avoids step sampling and returns the real timestamp of the written data
-                    # Query at end of day to get last sample within that day
-                    day_duration_seconds = int((end_dt - start_dt).total_seconds()) + 1
-                    tlast_query = f'tlast_over_time({query}[{day_duration_seconds}s])'
-                    
-                    # Execute instant query at end of day to get last timestamp
-                    query_result = prom.custom_query(query=tlast_query)
-                    
-                    # Parse instant query response to get timestamp
-                    # custom_query returns a list of results
-                    # tlast_over_time() returns the timestamp as the value: [evaluation_time, actual_timestamp]
-                    max_ts = None
-                    
-                    if query_result and isinstance(query_result, list):
-                        for result in query_result:
-                            if isinstance(result, dict):
-                                # Instant query format: {"metric": {...}, "value": [evaluation_timestamp, result_value]}
-                                # For tlast_over_time(), result_value is the actual timestamp of the last data point
-                                value_data = result.get("value")
-                                if value_data and isinstance(value_data, (list, tuple)) and len(value_data) >= 2:
-                                    # value_data[1] is the timestamp returned by tlast_over_time()
-                                    timestamp_value = float(value_data[1])
-                                    ts_dt = datetime.fromtimestamp(timestamp_value, tz=timezone.utc)
-                                    # Verify timestamp is within the forecast date
-                                    if ts_dt.date() == forecast_date:
-                                        max_ts = int(timestamp_value)
+                    # Use /api/v1/export to get raw data points with actual timestamps
+                    # This avoids step sampling and returns the real timestamps of written data points
+                    max_ts = self._query_export_max_timestamp(
+                        state, prom, query, start_dt, end_dt, forecast_date
+                    )
                     
                     if max_ts is not None:
                         timestamp_map[(forecast_date, forecast_type_name)] = max_ts
@@ -877,51 +952,6 @@ class MetricsForecastJob(BaseJob):
                     # Continue with other dates even if one fails
         
         return timestamp_map
-
-    def _calculate_forecast_timestamp(
-        self,
-        state: MetricsForecastState,
-        prom: PrometheusConnect,
-        metric_name: str,
-        labels: Dict[str, str],
-        forecast_date: date,
-    ) -> int:
-        """Assign deterministic timestamps per forecasted business day."""
-        start_dt = datetime.combine(forecast_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-        end_dt = datetime.combine(forecast_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-
-        label_pairs = [f'{k}="{v}"' for k, v in sorted(labels.items())]
-        query = f'{metric_name}{{{",".join(label_pairs)}}}'
-
-        try:
-            query_result = prom.custom_query_range(
-                query=query,
-                start_time=start_dt,
-                end_time=end_dt,
-                step="1s",
-            )
-
-            max_ts = None
-            if isinstance(query_result, dict):
-                data = query_result.get("data", {})
-                results = data.get("result", [])
-            else:
-                results = query_result or []
-
-            for series in results:
-                for value_pair in series.get("values", []):
-                    if not isinstance(value_pair, (list, tuple)) or not value_pair:
-                        continue
-                    ts_value = int(float(value_pair[0]))
-                    if max_ts is None or ts_value > max_ts:
-                        max_ts = ts_value
-
-            midnight_ts = int(start_dt.timestamp())
-            if max_ts is None:
-                return midnight_ts
-            return min(max_ts + 1, int(end_dt.timestamp()))
-        except Exception:
-            return int(start_dt.timestamp())
 
     def _build_metric_line(
         self, metric_name: str, labels: Dict[str, str], value: float, timestamp: int
