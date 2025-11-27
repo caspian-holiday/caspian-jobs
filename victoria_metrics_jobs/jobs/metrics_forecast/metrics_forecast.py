@@ -521,7 +521,30 @@ class MetricsForecastJob(BaseJob):
                             )
 
                     if publish_rows:
+                        # Log timestamps being written for debugging
+                        timestamps_by_date = {}
+                        for row in publish_rows:
+                            date_key = (row["metric_name"], row["labels"].get("forecast"), row["timestamp"])
+                            if date_key not in timestamps_by_date:
+                                timestamps_by_date[date_key] = []
+                            timestamps_by_date[date_key].append(row)
+                        
+                        # Check for duplicate timestamps in the same batch
+                        duplicates = {k: v for k, v in timestamps_by_date.items() if len(v) > 1}
+                        if duplicates:
+                            self.logger.warning(
+                                "Found duplicate timestamps in batch for %s: %s",
+                                series.metric_name,
+                                list(duplicates.keys())[:5],
+                            )
+                        
                         forecast_batch_df = pd.DataFrame(publish_rows)
+                        self.logger.info(
+                            "Writing %s forecast points for %s (sample timestamps: %s)",
+                            len(forecast_batch_df),
+                            series.metric_name,
+                            [row["timestamp"] for row in publish_rows[:3]],
+                        )
                         if self._write_metrics_dataframe_to_vm(
                             state, forecast_batch_df, timeout=60
                         ):
