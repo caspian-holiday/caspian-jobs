@@ -697,7 +697,11 @@ class BusinessDateConverterJob(BaseJob):
     
     # Step 4: Update job watermarks
     def _update_job_watermarks(self, state: BusinessDateConverterState) -> Result[BusinessDateConverterState, Exception]:
-        """Update job watermarks with latest processed timestamps."""
+        """Update job watermarks with latest processed timestamps.
+        
+        Only updates watermarks if we actually found input data (max_ts is not None).
+        This prevents updating the watermark when no new input data was found.
+        """
         try:
             if not state.vm_gateway_url:
                 self.logger.warning("No VM gateway URL configured, skipping watermark update")
@@ -706,10 +710,14 @@ class BusinessDateConverterJob(BaseJob):
             # Update watermarks with max processed timestamps
             for job_name in state.source_job_names:
                 try:
-                    # Use max processed timestamp if available, otherwise use current time
+                    # Only update watermark if we found input data
                     max_ts = state.max_processed_timestamps.get(job_name)
                     if max_ts is None:
-                        max_ts = int(datetime.now(timezone.utc).timestamp())
+                        self.logger.info(
+                            f"No input data found for job {job_name}, "
+                            "skipping watermark update"
+                        )
+                        continue
                     
                     watermark_line = f'latest_converted_timestamp_by_job_wm{{source="{job_name}"}} {max_ts} {max_ts}'
                     
