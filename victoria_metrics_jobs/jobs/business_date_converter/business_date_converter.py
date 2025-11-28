@@ -297,9 +297,8 @@ class BusinessDateConverterJob(BaseJob):
                     
                     self.logger.info(f"Querying metrics for job {job_name} from {start_time} to {end_time}")
                     
-                    # Query metrics using PromQL with grouping to get latest value per series+business_date
-                    # This is more efficient than fetching all data points and grouping locally
-                    grouped_metrics, max_timestamp_from_inputs = self._query_grouped_metrics(prom, job_name, start_time, end_time)
+                    # Query metrics using export API to get latest value per series+business_date with actual timestamps
+                    grouped_metrics, max_timestamp_from_inputs = self._query_grouped_metrics(state, prom, job_name, start_time, end_time)
                     
                     self.logger.info(f"Found {len(grouped_metrics)} unique metric series+business_date combinations for job {job_name}")
                     
@@ -370,89 +369,132 @@ class BusinessDateConverterJob(BaseJob):
             return Err(e)
     
     def _query_grouped_metrics(
-        self, prom: PrometheusConnect, job_name: str, start_time: datetime, end_time: datetime
+        self, state: BusinessDateConverterState, prom: PrometheusConnect, job_name: str, start_time: datetime, end_time: datetime
     ) -> Tuple[Dict[Tuple[str, tuple, str], Tuple[float, float]], Optional[int]]:
-        """Query metrics from VM with server-side grouping to get latest value per series+business_date.
+        """Query metrics from VM using export API to get latest value per series+business_date with actual timestamps.
         
-        Uses PromQL last_over_time() to get the latest value per metric series and business_date.
-        This is much more efficient than fetching all data points and grouping locally.
+        Uses Victoria Metrics /api/v1/export endpoint to get raw data points with actual timestamps.
+        Groups metrics locally by series+business_date and keeps the latest value per group based on actual timestamp.
         
         Returns:
             Tuple of:
             - dict: {(metric_name, labels_tuple, biz_date_str): (value, timestamp)}
               where labels_tuple is tuple(sorted(labels.items())) for hashability
-            - max_timestamp: Maximum timestamp seen across all input timeseries (for watermark)
+            - max_timestamp: Maximum actual timestamp seen across all input timeseries (for watermark)
         """
         grouped = {}
         max_timestamp = None
         
         try:
-            # Calculate time range in seconds for PromQL
-            # last_over_time() looks back from the evaluation time (now), so we need to calculate
-            # how far back to look from end_time to cover start_time
-            time_range_seconds = int((end_time - start_time).total_seconds())
+            if not state.vm_query_url:
+                self.logger.error("No VM query URL configured")
+                return {}, None
             
             # Ensure we have a positive time range
-            if time_range_seconds <= 0:
+            if start_time >= end_time:
                 self.logger.warning(f"Invalid time range: start_time={start_time}, end_time={end_time}")
                 return {}, None
             
-            # Query all metrics with job label using last_over_time to get latest value per series
-            # This efficiently groups server-side and returns only the latest value per series+biz_date
-            # last_over_time looks back from now, so we use the calculated range
+            # Get session from Prometheus client
+            session = prom._session
+            
+            # Build export API URL
+            # Extract base URL (remove /api/v1 if present)
+            base_url = state.vm_query_url.rstrip("/")
+            if base_url.endswith("/api/v1"):
+                base_url = base_url[:-7]
+            elif base_url.endswith("/api"):
+                base_url = base_url[:-4]
+            
+            # Prepare headers
+            headers = {}
+            if state.vm_token:
+                headers["Authorization"] = f"Bearer {state.vm_token}"
+            
+            # Build export query parameters
+            # The export endpoint uses match[] parameter for metric selector
             base_query = f'{{job="{job_name}"}}'
-            query = f'last_over_time({base_query}[{time_range_seconds}s])'
+            params = {
+                "match[]": base_query,
+                "start": int(start_time.timestamp()),
+                "end": int(end_time.timestamp()),
+            }
             
-            try:
-                # Execute instant query - last_over_time returns latest value per series in the time range
-                query_result = prom.custom_query(query=query)
+            # Make GET request to export endpoint
+            response = session.get(
+                f"{base_url}/api/v1/export",
+                params=params,
+                headers=headers,
+                timeout=30,
+            )
+            response.raise_for_status()
+            
+            # Parse export response
+            # Export format: newline-delimited JSON
+            # Each line: {"metric": {...}, "values": [value1, value2, ...], "timestamps": [timestamp1_ms, timestamp2_ms, ...]}
+            # Values and timestamps are separate arrays, aligned by index
+            content = response.text
+            
+            # Parse newline-delimited JSON format
+            for line in content.strip().split("\n"):
+                if not line.strip():
+                    continue
+                try:
+                    data_point = json.loads(line)
                     
-                if query_result:
-                    # Process results - each result represents one series with its latest value
-                    for result in query_result:
-                        metric_data = result.get('metric', {})
-                        metric_name = metric_data.get('__name__', '')
-                        if not metric_name:
+                    # Export format: {"metric": {...}, "values": [...], "timestamps": [...]}
+                    metric_data = data_point.get("metric", {})
+                    values = data_point.get("values", [])
+                    timestamps_ms = data_point.get("timestamps", [])
+                    
+                    # Extract metric name
+                    metric_name = metric_data.get("__name__", "")
+                    if not metric_name:
+                        continue
+                    
+                    # Extract labels
+                    labels = {k: v for k, v in metric_data.items() if k != "__name__"}
+                    
+                    # Extract biz_date
+                    biz_date_str = labels.pop("biz_date", None)
+                    if not biz_date_str:
+                        continue
+                    
+                    # Process all data points for this series
+                    # Values and timestamps arrays are aligned by index
+                    for value_raw, timestamp_ms_raw in zip(values, timestamps_ms):
+                        try:
+                            value = float(value_raw)
+                            timestamp_ms = float(timestamp_ms_raw)
+                            timestamp = int(timestamp_ms / 1000)  # Convert from milliseconds to seconds
+                            
+                            # Track max timestamp seen across all input timeseries
+                            if max_timestamp is None or timestamp > max_timestamp:
+                                max_timestamp = timestamp
+                            
+                            # Create key: (metric_name, labels_without_biz_date, biz_date)
+                            # Convert labels dict to tuple of sorted items for hashability
+                            labels_tuple = tuple(sorted(labels.items()))
+                            key = (metric_name, labels_tuple, biz_date_str)
+                            
+                            # Store value and timestamp
+                            # If key already exists, keep the one with latest timestamp
+                            if key not in grouped or timestamp > grouped[key][1]:
+                                grouped[key] = (value, timestamp)
+                                
+                        except (ValueError, TypeError, IndexError) as e:
+                            # Skip invalid data points
                             continue
-                        
-                        # Extract labels
-                        labels = {k: v for k, v in metric_data.items() if k != '__name__'}
-                        
-                        # Extract biz_date
-                        biz_date_str = labels.pop('biz_date', None)
-                        if not biz_date_str:
-                            continue
-                        
-                        # Get value - custom_query returns instant query format: {'value': [timestamp, value]}
-                        value_data = result.get('value')
-                        if not value_data or len(value_data) < 2:
-                            continue
-                        
-                        timestamp = float(value_data[0])
-                        value = float(value_data[1])
-                        
-                        # Track max timestamp seen across all input timeseries
-                        if max_timestamp is None or timestamp > max_timestamp:
-                            max_timestamp = timestamp
-                        
-                        # Create key: (metric_name, labels_without_biz_date, biz_date)
-                        # Convert labels dict to tuple of sorted items for hashability
-                        labels_tuple = tuple(sorted(labels.items()))
-                        key = (metric_name, labels_tuple, biz_date_str)
-                        
-                        # Store value and timestamp
-                        # If key already exists, keep the one with latest timestamp
-                        if key not in grouped or timestamp > grouped[key][1]:
-                            grouped[key] = (value, timestamp)
+                    
+                except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
+                    # Skip invalid lines
+                    continue
             
-            except Exception as e:
-                self.logger.error(f"Failed to query grouped metrics: {e}")
-                # Return empty dict on error
-        
         except Exception as e:
             self.logger.error(f"Failed to query grouped metrics: {e}")
             # Return empty dict on error
         
+        return grouped, int(max_timestamp) if max_timestamp is not None else None
         return grouped, int(max_timestamp) if max_timestamp is not None else None
     
     def _calculate_converted_timestamp(
