@@ -11,7 +11,7 @@ The job:
 5. Publishes job status metric to VictoriaMetrics
 
 Database Storage:
-- Forecasts are stored in a PostgreSQL 'forecasts' table
+- Forecasts are stored in a PostgreSQL 'vm_forecast' table
 - Primary key: (source, biz_date, metric_auid, metric_name, forecast_type)
 - Re-running forecasts overwrites existing values (idempotent)
 - Table is partitioned by source for better performance
@@ -883,14 +883,14 @@ class MetricsForecastJob(BaseJob):
             current_timestamp = datetime.utcnow()
             
             upsert_sql = text("""
-                INSERT INTO forecasts (
+                INSERT INTO vm_forecast (
                     source, biz_date, metric_auid, metric_name, 
                     metric_value, metric_labels, forecast_type,
                     created_at, updated_at
                 )
                 VALUES (
                     :source, :biz_date, :metric_auid, :metric_name,
-                    :metric_value, :metric_labels::jsonb, :forecast_type,
+                    :metric_value, CAST(:metric_labels AS jsonb), :forecast_type,
                     :created_at, :updated_at
                 )
                 ON CONFLICT (source, biz_date, metric_auid, metric_name, forecast_type)

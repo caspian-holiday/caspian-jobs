@@ -5,6 +5,7 @@ Extractor Job - Functional data extraction script with step-by-step workflow
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime, date, timezone
 from pathlib import Path
@@ -536,8 +537,15 @@ class ExtractorJob(BaseJob):
                     metric_name = metric['metric'].get('__name__', 'unknown')
                     labels = metric['metric']
                     
-                    # Extract audit_id and biz_date from labels
-                    audit_id = labels.get('audit_id')
+                    # Extract standard labels (similar to metrics_forecast job)
+                    # Support both 'auid' and 'audit_id' for backward compatibility
+                    auid = labels.get('auid') or labels.get('audit_id')
+                    if not auid:
+                        self.logger.warning(f"Metric {metric_name} missing auid/audit_id label, skipping")
+                        continue
+                    
+                    # Extract source (from 'job' label) and biz_date
+                    source = labels.get('job')  # 'job' label maps to 'source' in database
                     biz_date_str = labels.get('biz_date')
                     
                     # Parse biz_date from dd/mm/yyyy format
@@ -547,6 +555,15 @@ class ExtractorJob(BaseJob):
                             biz_date = datetime.strptime(biz_date_str, '%d/%m/%Y').date()
                         except ValueError:
                             self.logger.warning(f"Invalid biz_date format: {biz_date_str}")
+                    
+                    # Build remaining labels JSON (exclude standard labels)
+                    # Similar pattern to metrics_forecast job
+                    excluded_labels = {'job', 'source', 'auid', 'audit_id', 'biz_date', '__name__'}
+                    remaining_labels = {
+                        k: v for k, v in labels.items() 
+                        if k not in excluded_labels
+                    }
+                    metric_labels_json = json.dumps(remaining_labels, sort_keys=True)
                     
                     # Handle values array from prometheus_api_client (may contain single element)
                     values = metric.get('values', [])
@@ -589,10 +606,11 @@ class ExtractorJob(BaseJob):
                         # Prepare metric record for batch insert
                         metric_record = {
                             'biz_date': biz_date if biz_date else weekday,  # Use extracted biz_date or fallback to weekday
-                            'audit_id': audit_id,
+                            'metric_auid': auid,  # Renamed from audit_id
                             'metric_name': metric_name,
                             'value': value,
                             'timestamp': metric_timestamp,
+                            'metric_labels': metric_labels_json,  # New field
                             'extracted_at': current_time,
                             'job_id': state.job_id,
                             'job_execution_timestamp': execution_timestamp
@@ -608,10 +626,13 @@ class ExtractorJob(BaseJob):
                 if metric_records:
                     batch_insert_query = """
                     INSERT INTO vm_extracted_metrics (
-                        biz_date, audit_id, metric_name, value, timestamp, 
-                        extracted_at, job_id, job_execution_timestamp
+                        biz_date, metric_auid, metric_name, value, timestamp,
+                        metric_labels, extracted_at, job_id, job_execution_timestamp
                     )
-                    VALUES (:biz_date, :audit_id, :metric_name, :value, :timestamp, :extracted_at, :job_id, :job_execution_timestamp)
+                    VALUES (
+                        :biz_date, :metric_auid, :metric_name, :value, :timestamp,
+                        CAST(:metric_labels AS jsonb), :extracted_at, :job_id, :job_execution_timestamp
+                    )
                     """
                     
                     state.db_manager.execute_batch_insert(batch_insert_query, metric_records)
