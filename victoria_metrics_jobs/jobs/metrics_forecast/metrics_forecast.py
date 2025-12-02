@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Metrics Forecast Job - trains Prophet models per metric series and publishes
-business-day forecasts back to Victoria Metrics.
+Metrics Forecast Job - trains Prophet models per metric series and stores
+business-day forecasts in a PostgreSQL database.
+
+The job:
+1. Derives the current business date
+2. Collects historical metrics from VictoriaMetrics
+3. Trains Prophet models and generates forecasts
+4. Writes forecasts to the database with upsert logic
+5. Publishes job status metric to VictoriaMetrics
+
+Database Storage:
+- Forecasts are stored in a PostgreSQL 'forecasts' table
+- Primary key: (source, biz_date, metric_auid, metric_name, forecast_type)
+- Re-running forecasts overwrites existing values (idempotent)
+- Table is partitioned by source for better performance
 """
 
 from __future__ import annotations
@@ -20,6 +33,10 @@ import numpy as np
 import pandas as pd
 from prophet import Prophet
 from prometheus_api_client import PrometheusConnect
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
+from urllib.parse import quote_plus
 
 # Add the scheduler module to the path for imports shared with other jobs
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -62,6 +79,9 @@ class MetricsForecastState(BaseJobState):
     forecasts_written: int = 0
     failed_series: int = 0
     prom_client: Optional[PrometheusConnect] = None
+    forecast_db_config: Dict[str, Any] = field(default_factory=dict)
+    db_engine: Optional[Engine] = None
+    db_connection: Optional[Any] = None
 
     def to_results(self) -> Dict[str, Any]:
         """Extend base results with forecasting metadata."""
@@ -131,6 +151,18 @@ class MetricsForecastJob(BaseJob):
 
             victoria_metrics_cfg = job_config.get("victoria_metrics", {})
 
+            # Get database configuration - check for forecast_database first, fallback to common database
+            forecast_db_config = job_config.get("forecast_database")
+            if not forecast_db_config:
+                # Try to get common database config
+                forecast_db_config = job_config.get("database")
+            
+            if not forecast_db_config:
+                raise ValueError(
+                    "Database configuration required for forecast storage. "
+                    "Specify 'forecast_database' in job config or 'database' in common config."
+                )
+
             state = MetricsForecastState(
                 job_id=job_id,
                 job_config=job_config,
@@ -149,6 +181,7 @@ class MetricsForecastJob(BaseJob):
                 vm_query_url=victoria_metrics_cfg.get("query_url", ""),
                 vm_gateway_url=victoria_metrics_cfg.get("gateway_url", ""),
                 vm_token=victoria_metrics_cfg.get("token", ""),
+                forecast_db_config=forecast_db_config,
             )
 
             return Ok(state)
@@ -164,6 +197,9 @@ class MetricsForecastJob(BaseJob):
         ]
 
     def finalize_state(self, state: MetricsForecastState) -> MetricsForecastState:
+        # Close database connection before finalizing
+        self._close_database_connection(state)
+        
         state.completed_at = datetime.now()
         if state.failed_series > 0 and state.forecasts_written == 0:
             state.status = "error"
@@ -264,7 +300,7 @@ class MetricsForecastJob(BaseJob):
             self.logger.error("Failed to collect metric histories: %s", exc)
             return Err(exc)
 
-    # Step 3: Train Prophet models and publish forecasts
+    # Step 3: Train Prophet models and write forecasts to database
     def _forecast_and_publish(
         self, state: MetricsForecastState
     ) -> Result[MetricsForecastState, Exception]:
@@ -273,11 +309,15 @@ class MetricsForecastJob(BaseJob):
                 self.logger.warning("No metric series discovered for forecasting")
                 return Ok(state)
 
+            # Initialize database connection
+            conn = self._get_database_connection(state)
+            if conn is None:
+                raise ValueError("Database connection could not be established")
+            
+            # Still need Prometheus client for history collection (already done in step 2)
             prom = self._get_prometheus_client(state)
             if prom is None:
                 raise ValueError("Prometheus client could not be initialized")
-            if not state.vm_gateway_url:
-                raise ValueError("victoria_metrics.gateway_url must be configured")
 
             for series_idx, series in enumerate(state.series_histories):
                 try:
@@ -423,66 +463,13 @@ class MetricsForecastJob(BaseJob):
                     future_df = pd.DataFrame({"ds": future_dates})
                     forecast_df = model.predict(future_df)
 
-                    # Extract unique forecast dates for batch timestamp lookup
-                    forecast_dates = [row.ds.date() for row in forecast_df.itertuples()]
-                    unique_forecast_dates = sorted(set(forecast_dates))
-                    
-                    # Batch lookup existing forecast timestamps once per series
-                    # CRITICAL: Use series.labels directly - this must match exactly what we write
-                    # When writing: labels = series.labels.copy() then labels["forecast"] = name
-                    # When querying: labels = base_labels.copy() then labels["forecast"] = forecast_type_name
-                    # So base_labels must equal series.labels for the query to match what was written
-                    timestamp_map = self._batch_lookup_forecast_timestamps(
-                        state,
-                        prom,
-                        series.metric_name,
-                        series.labels,  # Use series.labels directly - must match what we write
-                        state.forecast_types,
-                        unique_forecast_dates,
+                    # Write forecasts to database (replaces VictoriaMetrics write)
+                    rows_written = self._write_forecasts_to_database(
+                        state, series, forecast_df
                     )
                     
-                    publish_rows: List[Dict[str, Any]] = []
-                    for future_row in forecast_df.itertuples():
-                        forecast_date = future_row.ds.date()
-                        for forecast_type in state.forecast_types:
-                            name = forecast_type.get("name")
-                            field = forecast_type.get("field")
-                            if not name or not field or not hasattr(future_row, field):
-                                continue
-                            value = getattr(future_row, field)
-                            if value is None:
-                                continue
-
-                            labels = series.labels.copy()
-                            labels["forecast"] = name
-
-                            # Look up timestamp from batch lookup map
-                            existing_max_ts = timestamp_map.get((forecast_date, name))
-                            
-                            if existing_max_ts is not None:
-                                # Increment by 1 minute for deterministic overwriting (matches query step)
-                                end_dt = datetime.combine(forecast_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-                                timestamp = min(existing_max_ts + 60, int(end_dt.timestamp()))
-                            else:
-                                # No existing forecast, use midnight timestamp
-                                start_dt = datetime.combine(forecast_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-                                timestamp = int(start_dt.timestamp())
-                            
-                            publish_rows.append(
-                                {
-                                    "metric_name": series.metric_name,
-                                    "labels": labels,
-                                    "value": float(value),
-                                    "timestamp": timestamp,
-                                }
-                            )
-
-                    if publish_rows:
-                        forecast_batch_df = pd.DataFrame(publish_rows)
-                        if self._write_metrics_dataframe_to_vm(
-                            state, forecast_batch_df, timeout=60
-                        ):
-                            state.forecasts_written += len(forecast_batch_df)
+                    if rows_written > 0:
+                        state.forecasts_written += rows_written
 
                     state.series_processed += 1
                     
@@ -700,6 +687,252 @@ class MetricsForecastJob(BaseJob):
         
         return model
 
+    def _build_database_connection_string(self, db_config: Dict[str, Any]) -> str:
+        """Build PostgreSQL connection string from config.
+        
+        Args:
+            db_config: Database configuration dictionary
+            
+        Returns:
+            PostgreSQL connection string
+        """
+        host = db_config.get("host", "localhost")
+        port = db_config.get("port", 5432)
+        dbname = db_config.get("name", "forecasts")
+        user = db_config.get("user", "forecast_user")
+        password = db_config.get("password", "")
+        sslmode = db_config.get("ssl_mode", "prefer")
+        connect_timeout = db_config.get("connection_timeout", 10)
+        
+        # URL-encode password to handle special characters
+        if password:
+            password = quote_plus(password)
+        
+        # Build connection string
+        connection_string = (
+            f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+            f"?sslmode={sslmode}&connect_timeout={connect_timeout}"
+        )
+        
+        return connection_string
+
+    def _get_database_engine(self, state: MetricsForecastState) -> Optional[Engine]:
+        """Get or create SQLAlchemy engine for forecast database.
+        
+        Args:
+            state: Job state with database configuration
+            
+        Returns:
+            SQLAlchemy engine or None if creation fails
+        """
+        if state.db_engine:
+            return state.db_engine
+        
+        try:
+            if not state.forecast_db_config:
+                self.logger.error("No database configuration available")
+                return None
+            
+            connection_string = self._build_database_connection_string(state.forecast_db_config)
+            
+            # Create engine with connection pooling
+            state.db_engine = create_engine(
+                connection_string,
+                pool_size=5,
+                max_overflow=10,
+                pool_pre_ping=True,
+                pool_recycle=3600,
+                echo=False,
+                future=True
+            )
+            
+            self.logger.info("Database engine created successfully")
+            return state.db_engine
+            
+        except Exception as exc:
+            self.logger.error("Failed to create database engine: %s", exc)
+            return None
+
+    def _get_database_connection(self, state: MetricsForecastState) -> Optional[Any]:
+        """Get or create database connection.
+        
+        Args:
+            state: Job state with database engine
+            
+        Returns:
+            Database connection or None if creation fails
+        """
+        if state.db_connection:
+            return state.db_connection
+        
+        try:
+            engine = self._get_database_engine(state)
+            if not engine:
+                return None
+            
+            state.db_connection = engine.connect()
+            self.logger.info("Database connection established")
+            return state.db_connection
+            
+        except Exception as exc:
+            self.logger.error("Failed to create database connection: %s", exc)
+            return None
+
+    def _close_database_connection(self, state: MetricsForecastState) -> None:
+        """Close database connection and dispose of engine.
+        
+        Args:
+            state: Job state with database connection and engine
+        """
+        try:
+            if state.db_connection:
+                state.db_connection.close()
+                state.db_connection = None
+                self.logger.info("Database connection closed")
+            
+            if state.db_engine:
+                state.db_engine.dispose()
+                state.db_engine = None
+                self.logger.info("Database engine disposed")
+                
+        except Exception as exc:
+            self.logger.warning("Error closing database connection: %s", exc)
+
+    def _write_forecasts_to_database(
+        self,
+        state: MetricsForecastState,
+        series: SeriesHistory,
+        forecast_df: pd.DataFrame,
+    ) -> int:
+        """Write forecast data to database using upsert logic.
+        
+        Args:
+            state: Job state with database connection
+            series: Series history containing metric metadata
+            forecast_df: Prophet forecast DataFrame with predictions
+            
+        Returns:
+            Number of forecast rows written
+        """
+        try:
+            conn = self._get_database_connection(state)
+            if not conn:
+                raise ValueError("Database connection not available")
+            
+            # Extract required labels
+            source = series.labels.get(state.source_label)
+            if not source:
+                self.logger.error(
+                    "Missing '%s' label in series %s",
+                    state.source_label,
+                    series.metric_name,
+                )
+                return 0
+            
+            auid = series.labels.get("auid")
+            if not auid:
+                self.logger.error(
+                    "Missing 'auid' label in series %s",
+                    series.metric_name,
+                )
+                return 0
+            
+            # Build remaining labels JSON (exclude source, auid, biz_date, forecast)
+            excluded_labels = {state.source_label, "auid", "biz_date", "forecast"}
+            remaining_labels = {
+                k: v for k, v in series.labels.items() 
+                if k not in excluded_labels
+            }
+            metric_labels_json = json.dumps(remaining_labels, sort_keys=True)
+            
+            # Prepare rows for batch insert
+            rows_to_insert = []
+            
+            for future_row in forecast_df.itertuples():
+                forecast_date = future_row.ds.date()
+                
+                for forecast_type in state.forecast_types:
+                    name = forecast_type.get("name")
+                    field = forecast_type.get("field")
+                    if not name or not field or not hasattr(future_row, field):
+                        continue
+                    
+                    value = getattr(future_row, field)
+                    if value is None or np.isnan(value):
+                        continue
+                    
+                    rows_to_insert.append({
+                        "source": source,
+                        "biz_date": forecast_date,
+                        "metric_auid": auid,
+                        "metric_name": series.metric_name,
+                        "metric_value": float(value),
+                        "metric_labels": metric_labels_json,
+                        "forecast_type": name,
+                        "created_at": current_timestamp,
+                        "updated_at": current_timestamp,
+                    })
+            
+            if not rows_to_insert:
+                self.logger.debug("No forecast rows to write for %s", series.metric_name)
+                return 0
+            
+            # Build PostgreSQL upsert statement
+            # ON CONFLICT ... DO UPDATE for idempotent writes
+            # Client supplies both created_at and updated_at timestamps
+            current_timestamp = datetime.utcnow()
+            
+            upsert_sql = text("""
+                INSERT INTO forecasts (
+                    source, biz_date, metric_auid, metric_name, 
+                    metric_value, metric_labels, forecast_type,
+                    created_at, updated_at
+                )
+                VALUES (
+                    :source, :biz_date, :metric_auid, :metric_name,
+                    :metric_value, :metric_labels::jsonb, :forecast_type,
+                    :created_at, :updated_at
+                )
+                ON CONFLICT (source, biz_date, metric_auid, metric_name, forecast_type)
+                DO UPDATE SET
+                    metric_value = EXCLUDED.metric_value,
+                    metric_labels = EXCLUDED.metric_labels,
+                    updated_at = EXCLUDED.updated_at
+            """)
+            
+            # Execute batch insert
+            for row in rows_to_insert:
+                conn.execute(upsert_sql, row)
+            
+            conn.commit()
+            
+            self.logger.info(
+                "Wrote %s forecast rows for %s (auid=%s)",
+                len(rows_to_insert),
+                series.metric_name,
+                auid,
+            )
+            
+            return len(rows_to_insert)
+            
+        except SQLAlchemyError as exc:
+            self.logger.error(
+                "Database error writing forecasts for %s: %s",
+                series.metric_name,
+                exc,
+            )
+            # Rollback on error
+            if conn:
+                conn.rollback()
+            return 0
+        except Exception as exc:
+            self.logger.error(
+                "Failed to write forecasts to database for %s: %s",
+                series.metric_name,
+                exc,
+            )
+            return 0
+
     def _get_prometheus_client(self, state: MetricsForecastState) -> Optional[PrometheusConnect]:
         if state.prom_client:
             return state.prom_client
@@ -715,38 +948,9 @@ class MetricsForecastJob(BaseJob):
     def _write_metric_to_vm(
         self, state: MetricsForecastState, metric_line: str, timeout: int = 60
     ) -> bool:
-        return self._post_payload_to_vm(
-            state, metric_line, timeout=timeout, context="metric"
-        )
-
-    def _write_metrics_dataframe_to_vm(
-        self, state: MetricsForecastState, dataframe: pd.DataFrame, timeout: int = 60
-    ) -> bool:
-        """Publish a pandas DataFrame of forecast rows in a single VM import."""
-        if dataframe is None or dataframe.empty:
-            return True
-
-        metric_lines: List[str] = []
-        for row in dataframe.itertuples(index=False):
-            metric_lines.append(
-                self._build_metric_line(
-                    getattr(row, "metric_name"),
-                    getattr(row, "labels"),
-                    float(getattr(row, "value")),
-                    int(getattr(row, "timestamp")),
-                )
-            )
-
-        payload = "\n".join(metric_lines)
-        return self._post_payload_to_vm(
-            state, payload, timeout=timeout, context="forecast batch"
-        )
-
-    def _post_payload_to_vm(
-        self, state: MetricsForecastState, payload: str, timeout: int, context: str
-    ) -> bool:
+        """Write a single metric line to VictoriaMetrics (used for job status metric)."""
         try:
-            if not payload:
+            if not metric_line:
                 return False
             if not state.vm_gateway_url:
                 self.logger.error("VM gateway URL not configured")
@@ -762,201 +966,15 @@ class MetricsForecastJob(BaseJob):
                 headers["Authorization"] = f"Bearer {state.vm_token}"
             response = session.post(
                 f"{state.vm_gateway_url}/api/v1/import/prometheus",
-                data=payload,
+                data=metric_line,
                 headers=headers,
                 timeout=timeout,
             )
             response.raise_for_status()
             return True
         except Exception as exc:
-            self.logger.error("Failed to write %s to VM: %s", context, exc)
+            self.logger.error("Failed to write metric to VM: %s", exc)
             return False
-
-    def _query_export_max_timestamp(
-        self,
-        state: MetricsForecastState,
-        prom: PrometheusConnect,
-        query: str,
-        start_dt: datetime,
-        end_dt: datetime,
-        forecast_date: date,
-    ) -> Optional[int]:
-        """Query VictoriaMetrics /api/v1/export endpoint to get raw data points with actual timestamps.
-        
-        The export endpoint returns actual data points without step sampling, allowing us to
-        find the real max timestamp of written data points.
-        
-        Args:
-            state: Job state with VM configuration
-            prom: Prometheus client (used to get session)
-            query: PromQL query string (metric with labels)
-            start_dt: Start datetime for the query
-            end_dt: End datetime for the query
-            forecast_date: Forecast date to filter results
-            
-        Returns:
-            Max timestamp found, or None if no data exists
-        """
-        try:
-            if not state.vm_query_url:
-                return None
-            
-            # Get session from Prometheus client
-            session = prom._session
-            
-            # Build export API URL
-            # Extract base URL (remove /api/v1 if present)
-            base_url = state.vm_query_url.rstrip("/")
-            if base_url.endswith("/api/v1"):
-                base_url = base_url[:-7]
-            elif base_url.endswith("/api"):
-                base_url = base_url[:-4]
-            
-            # Prepare headers
-            headers = {}
-            if state.vm_token:
-                headers["Authorization"] = f"Bearer {state.vm_token}"
-            
-            # Build export query parameters
-            # The export endpoint uses match[] parameter for metric selector
-            params = {
-                "match[]": query,
-                "start": int(start_dt.timestamp()),
-                "end": int(end_dt.timestamp()),
-            }
-            
-            # Make GET request to export endpoint
-            response = session.get(
-                f"{base_url}/api/v1/export",
-                params=params,
-                headers=headers,
-                timeout=30,
-            )
-            response.raise_for_status()
-            
-            # Parse export response
-            # Export format: newline-delimited JSON
-            # Each line: {"metric": {...}, "values": [value1, value2, ...], "timestamps": [timestamp1_ms, timestamp2_ms, ...]}
-            # Values and timestamps are separate arrays, aligned by index
-            max_ts = None
-            content = response.text
-            
-            # Parse newline-delimited JSON format
-            for line in content.strip().split("\n"):
-                if not line.strip():
-                    continue
-                try:
-                    data_point = json.loads(line)
-                    
-                    # Export format: {"metric": {...}, "values": [...], "timestamps": [...]}
-                    timestamps = data_point.get("timestamps", [])
-                    
-                    # Process timestamps array (values are not needed for timestamp lookup)
-                    for timestamp_ms_raw in timestamps:
-                        timestamp_ms = float(timestamp_ms_raw)
-                        timestamp = int(timestamp_ms / 1000)
-                        
-                        ts_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-                        if ts_dt.date() == forecast_date:
-                            if max_ts is None or timestamp > max_ts:
-                                max_ts = timestamp
-                                
-                except (json.JSONDecodeError, ValueError, KeyError, TypeError, IndexError):
-                    # Skip invalid lines
-                    continue
-            
-            return max_ts
-            
-        except Exception as exc:
-            self.logger.warning(
-                "Failed to query export endpoint for timestamp lookup: %s",
-                exc,
-            )
-            return None
-
-    def _batch_lookup_forecast_timestamps(
-        self,
-        state: MetricsForecastState,
-        prom: PrometheusConnect,
-        metric_name: str,
-        base_labels: Dict[str, str],
-        forecast_types: List[Dict[str, str]],
-        forecast_dates: List[date],
-    ) -> Dict[Tuple[date, str], Optional[int]]:
-        """Batch lookup existing forecast timestamps for all forecast dates and types.
-        
-        Queries VictoriaMetrics per date per forecast_type to avoid overwhelming VM
-        with large range queries. Returns a map of (forecast_date, forecast_type_name) -> max_timestamp.
-        
-        Args:
-            state: Job state object
-            prom: Prometheus client for querying VM
-            metric_name: Name of the metric
-            base_labels: Labels without the forecast type label
-            forecast_types: List of forecast type configs with 'name' field
-            forecast_dates: List of forecast dates to check
-            
-        Returns:
-            Dictionary mapping (forecast_date, forecast_type_name) -> max_timestamp (or None)
-        """
-        if not forecast_dates:
-            return {}
-        
-        # Initialize result map with None for all combinations
-        timestamp_map: Dict[Tuple[date, str], Optional[int]] = {}
-        for forecast_date in forecast_dates:
-            for forecast_type in forecast_types:
-                forecast_type_name = forecast_type.get("name")
-                if forecast_type_name:
-                    timestamp_map[(forecast_date, forecast_type_name)] = None
-        
-        # Query per date per forecast_type to avoid overwhelming VM with large range queries
-        # This is still batched compared to per-point queries
-        for forecast_type in forecast_types:
-            forecast_type_name = forecast_type.get("name")
-            if not forecast_type_name:
-                continue
-            
-            # Build labels with forecast type (must match exactly how we write them)
-            # CRITICAL: This must match exactly: labels = series.labels.copy() then labels["forecast"] = name
-            labels = base_labels.copy()
-            labels["forecast"] = forecast_type_name
-            
-            label_pairs = [f'{k}="{v}"' for k, v in sorted(labels.items())]
-            query = f'{metric_name}{{{",".join(label_pairs)}}}'
-            
-            # Query each date individually to get max timestamp (same approach as business_date_converter)
-            for forecast_date in forecast_dates:
-                start_dt = datetime.combine(forecast_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-                end_dt = datetime.combine(forecast_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-                
-                try:
-                    # Use /api/v1/export to get raw data points with actual timestamps
-                    # This avoids step sampling and returns the real timestamps of written data points
-                    max_ts = self._query_export_max_timestamp(
-                        state, prom, query, start_dt, end_dt, forecast_date
-                    )
-                    
-                    if max_ts is not None:
-                        timestamp_map[(forecast_date, forecast_type_name)] = max_ts
-                        
-                except Exception as exc:
-                    self.logger.warning(
-                        "Failed to lookup timestamp for %s/%s on %s: %s",
-                        metric_name,
-                        forecast_type_name,
-                        forecast_date,
-                        exc,
-                    )
-                    # Continue with other dates even if one fails
-        
-        return timestamp_map
-
-    def _build_metric_line(
-        self, metric_name: str, labels: Dict[str, str], value: float, timestamp: int
-    ) -> str:
-        label_pairs = [f'{key}="{value}"' for key, value in sorted(labels.items())]
-        return f'{metric_name}{{{",".join(label_pairs)}}} {value} {timestamp}'
 
 
 def main():

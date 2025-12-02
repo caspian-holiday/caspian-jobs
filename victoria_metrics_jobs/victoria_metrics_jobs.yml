@@ -150,6 +150,19 @@ environments:
         # Job-specific attributes
         job_type: metrics_forecast
         victoria_metrics: ${environments.local.victoria_metrics}
+        # Database configuration for forecast storage
+        # Optional: if not specified, uses common database config
+        # Uncomment and configure to use a separate database for forecasts
+        # forecast_database:
+        #   host: ${oc.env:VM_JOBS_FORECAST_DB_HOST,localhost}
+        #   port: ${oc.env:VM_JOBS_FORECAST_DB_PORT,5432}
+        #   name: ${oc.env:VM_JOBS_FORECAST_DB_NAME,forecasts_db}
+        #   user: ${oc.env:VM_JOBS_FORECAST_DB_USER,forecast_user}
+        #   password: ${oc.env:VM_JOBS_FORECAST_DB_PASSWORD,}
+        #   ssl_mode: ${oc.env:VM_JOBS_FORECAST_DB_SSL_MODE,prefer}
+        #   connection_timeout: ${oc.env:VM_JOBS_FORECAST_DB_CONNECTION_TIMEOUT,10}
+        # If forecast_database is not specified, fallback to common database
+        database: ${environments.local.database}
         source_job_names:
           - apex_collector
         source_label: source
@@ -322,6 +335,19 @@ environments:
         # Job-specific attributes
         job_type: metrics_forecast
         victoria_metrics: ${environments.dev.victoria_metrics}
+        # Database configuration for forecast storage
+        # Optional: if not specified, uses common database config
+        # Uncomment and configure to use a separate database for forecasts
+        # forecast_database:
+        #   host: ${oc.env:VM_JOBS_FORECAST_DB_HOST,localhost}
+        #   port: ${oc.env:VM_JOBS_FORECAST_DB_PORT,5432}
+        #   name: ${oc.env:VM_JOBS_FORECAST_DB_NAME,forecasts_db}
+        #   user: ${oc.env:VM_JOBS_FORECAST_DB_USER,forecast_user}
+        #   password: ${env_required:VM_JOBS_FORECAST_DB_PASSWORD,Forecast database password is required}
+        #   ssl_mode: ${oc.env:VM_JOBS_FORECAST_DB_SSL_MODE,require}
+        #   connection_timeout: ${oc.env:VM_JOBS_FORECAST_DB_CONNECTION_TIMEOUT,10}
+        # If forecast_database is not specified, fallback to common database
+        database: ${environments.dev.database}
         source_job_names:
           - apex_collector
         source_label: source

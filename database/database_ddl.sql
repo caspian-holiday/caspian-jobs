@@ -1,5 +1,5 @@
 -- PostgreSQL DDL Script for VictoriaMetrics Jobs Integration
--- This script creates the necessary tables for extractor jobs
+-- This script creates the necessary tables for extractor and forecast jobs
 -- Generic approach supporting any system that needs data extraction from VictoriaMetrics
 --
 -- Note: Assumes tables will be placed in an existing schema
@@ -41,6 +41,60 @@ CREATE TABLE IF NOT EXISTS vm_extracted_metrics (
     -- Constraints
     CONSTRAINT chk_extracted_metrics_value CHECK (value IS NOT NULL)
 );
+
+-- Table to store metric forecasts
+-- This table is used by the metrics_forecast job to store Prophet-generated forecasts
+-- Partitioned by source for better performance with multiple data sources
+-- Note: created_at and updated_at timestamps are supplied by the client application
+CREATE TABLE IF NOT EXISTS forecasts (
+    source VARCHAR(255) NOT NULL,
+    biz_date DATE NOT NULL,
+    metric_auid VARCHAR(255) NOT NULL,
+    metric_name VARCHAR(255) NOT NULL,
+    metric_value NUMERIC NOT NULL,
+    metric_labels JSONB,
+    forecast_type VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    
+    -- Primary key for upsert operations
+    -- Re-running forecasts on the same biz_date will overwrite existing values
+    PRIMARY KEY (source, biz_date, metric_auid, metric_name, forecast_type)
+) PARTITION BY LIST (source);
+
+-- Create default partition for sources without specific partitions
+-- This catches any source values that don't have a dedicated partition
+CREATE TABLE IF NOT EXISTS forecasts_default PARTITION OF forecasts DEFAULT;
+
+-- Create specific partition for autosys_jobs source
+-- This provides optimized storage and query performance for autosys_jobs forecasts
+CREATE TABLE IF NOT EXISTS forecasts_autosys_jobs 
+  PARTITION OF forecasts FOR VALUES IN ('autosys_jobs');
+
+-- Example: Create additional source-specific partitions as needed
+-- CREATE TABLE IF NOT EXISTS forecasts_apex_collector 
+--   PARTITION OF forecasts FOR VALUES IN ('apex_collector');
+
+-- Indexes on forecast table for common query patterns
+CREATE INDEX IF NOT EXISTS idx_forecasts_biz_date 
+    ON forecasts (biz_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_forecasts_metric_name 
+    ON forecasts (metric_name);
+
+CREATE INDEX IF NOT EXISTS idx_forecasts_auid 
+    ON forecasts (metric_auid);
+
+CREATE INDEX IF NOT EXISTS idx_forecasts_forecast_type 
+    ON forecasts (forecast_type);
+
+-- GIN index for efficient JSONB queries on metric_labels
+CREATE INDEX IF NOT EXISTS idx_forecasts_metric_labels 
+    ON forecasts USING GIN (metric_labels);
+
+-- Composite index for common filtering patterns
+CREATE INDEX IF NOT EXISTS idx_forecasts_source_date_name 
+    ON forecasts (source, biz_date DESC, metric_name);
 
 
 
