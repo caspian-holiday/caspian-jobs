@@ -293,11 +293,10 @@ class MetricsForecastJob(BaseJob):
                     len(state.source_job_names),
                 )
             else:
-                # Query by metric selectors only (complete PromQL selectors)
+                # Query by metric selectors only (use selectors as-is, no modification)
                 for selector in state.metric_selectors:
-                    query = self._build_metric_selector(
-                        selector, "job", source_name=None
-                    )
+                    # Use selector unmodified - it's complete PromQL
+                    query = selector.strip()
                     query_result = prom.custom_query_range(
                         query=query,
                         start_time=start_dt,
@@ -557,32 +556,34 @@ class MetricsForecastJob(BaseJob):
     def _build_metric_selector(
         self, selector: str, label_key: str, source_name: Optional[str] = None
     ) -> str:
-        """Build metric selector with optional source label filtering.
+        """Build metric selector with optional job label filtering.
+        
+        When source_name is provided, adds job label filter to the selector.
+        When source_name is None, returns selector unmodified.
         
         Args:
-            selector: Complete PromQL selector (no placeholder support)
-            label_key: Source label key (e.g., 'source')
-            source_name: Optional source value to filter by. If None, selector is returned as-is.
+            selector: PromQL selector
+            label_key: Label key to add (e.g., 'job')
+            source_name: Optional label value to filter by. If None, selector is returned as-is.
             
         Returns:
-            PromQL selector with optional source filtering
+            PromQL selector with optional label filtering
         """
-        selector = selector.strip()
+        # Return selector unmodified if no source_name provided
+        if source_name is None:
+            return selector.strip()
         
-        # If no source_name, return selector as-is (complete PromQL)
-        if source_name is None or source_name == "":
-            return selector
-
-        # Add source label filter when source_name is provided
+        # Add job label filter when source_name is provided
+        selector = selector.strip()
         label_pattern = rf'{label_key}\s*=\s*"[^"]*"'
 
-        def add_source_label(label_body: str) -> str:
-            """Add or replace source label in label body."""
+        def add_job_label(label_body: str) -> str:
+            """Add or replace job label in label body."""
             if re.search(label_pattern, label_body):
-                # Replace existing source label
+                # Replace existing job label
                 label_body = re.sub(label_pattern, f'{label_key}="{source_name}"', label_body)
             else:
-                # Add source label
+                # Add job label
                 label_body = label_body.strip()
                 if label_body:
                     label_body = f'{label_body},{label_key}="{source_name}"'
@@ -590,15 +591,15 @@ class MetricsForecastJob(BaseJob):
                     label_body = f'{label_key}="{source_name}"'
             return label_body
 
-        # Check for label-only selector first (e.g., {job="api"})
+        # Check for label-only selector first (e.g., {__name__!=""})
         if selector.startswith("{") and selector.endswith("}"):
-            label_body = add_source_label(selector.strip("{}"))
+            label_body = add_job_label(selector.strip("{}"))
             return f"{{{label_body}}}"
 
-        # Check for metric name with labels (e.g., metric_name{job="api"})
+        # Check for metric name with labels (e.g., metric_name{label="value"})
         if "{" in selector and selector.endswith("}"):
             metric_name, label_body = selector.split("{", 1)
-            label_body = add_source_label(label_body.rstrip("}"))
+            label_body = add_job_label(label_body.rstrip("}"))
             return f"{metric_name}{{{label_body}}}"
 
         # For simple metric names without braces (e.g., metric_name)
