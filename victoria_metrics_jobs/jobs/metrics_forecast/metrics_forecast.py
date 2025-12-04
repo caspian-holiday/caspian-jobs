@@ -598,14 +598,16 @@ class MetricsForecastJob(BaseJob):
             
             return label_body
 
+        # Check for label-only selector first (more specific)
+        if selector.startswith("{") and selector.endswith("}"):
+            label_body = ensure_label(selector.strip("{}"))
+            return f"{{{label_body}}}"
+
+        # Check for metric name with labels
         if "{" in selector and selector.endswith("}"):
             metric_name, label_body = selector.split("{", 1)
             label_body = ensure_label(label_body.rstrip("}"))
             return f"{metric_name}{{{label_body}}}"
-
-        if selector.startswith("{") and selector.endswith("}"):
-            label_body = ensure_label(selector.strip("{}"))
-            return f"{{{label_body}}}"
 
         # For simple metric names without braces
         if source_name:
@@ -922,9 +924,9 @@ class MetricsForecastJob(BaseJob):
                     rows_to_insert.append({
                         "source": source,
                         "biz_date": forecast_date,
-                        "metric_auid": auid,
+                        "auid": auid,
                         "metric_name": series.metric_name,
-                        "metric_value": float(value),
+                        "value": float(value),
                         "metric_labels": metric_labels_json,
                         "forecast_type": name,
                         "created_at": current_timestamp,
@@ -939,19 +941,19 @@ class MetricsForecastJob(BaseJob):
             # ON CONFLICT ... DO UPDATE for idempotent writes
             
             upsert_sql = text("""
-                INSERT INTO vm_forecast (
-                    source, biz_date, metric_auid, metric_name, 
-                    metric_value, metric_labels, forecast_type,
+                INSERT INTO vm_forecasted_metric (
+                    source, biz_date, auid, metric_name, 
+                    value, metric_labels, forecast_type,
                     created_at, updated_at
                 )
                 VALUES (
-                    :source, :biz_date, :metric_auid, :metric_name,
-                    :metric_value, CAST(:metric_labels AS jsonb), :forecast_type,
+                    :source, :biz_date, :auid, :metric_name,
+                    :value, CAST(:metric_labels AS jsonb), :forecast_type,
                     :created_at, :updated_at
                 )
-                ON CONFLICT (source, biz_date, metric_auid, metric_name, forecast_type)
+                ON CONFLICT (source, biz_date, auid, metric_name, forecast_type)
                 DO UPDATE SET
-                    metric_value = EXCLUDED.metric_value,
+                    value = EXCLUDED.value,
                     metric_labels = EXCLUDED.metric_labels,
                     updated_at = EXCLUDED.updated_at
             """)
