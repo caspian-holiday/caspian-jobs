@@ -278,6 +278,7 @@ class MetricsForecastJob(BaseJob):
                     query = self._build_metric_selector(
                         "{__name__!=\"\"}", "job", job_name
                     )
+                    self.logger.debug("Executing query for job=%s: %s", job_name, query)
                     query_result = prom.custom_query_range(
                         query=query,
                         start_time=start_dt,
@@ -295,8 +296,10 @@ class MetricsForecastJob(BaseJob):
             else:
                 # Query by metric selectors only (use selectors as-is, no modification)
                 for selector in state.metric_selectors:
-                    # Use selector unmodified - it's complete PromQL
-                    query = selector.strip()
+                    # Normalize selector: PromQL requires double quotes for label values
+                    # Replace single quotes with double quotes for label matchers
+                    query = selector.strip().replace("'", '"')
+                    self.logger.debug("Executing selector query: %s", query)
                     query_result = prom.custom_query_range(
                         query=query,
                         start_time=start_dt,
