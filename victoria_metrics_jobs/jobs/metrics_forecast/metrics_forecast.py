@@ -842,11 +842,20 @@ class MetricsForecastJob(BaseJob):
             if not conn:
                 raise ValueError("Database connection not available")
             
+            # Extract job label (required for database partitioning)
+            job = series.labels.get("job")
+            if not job:
+                self.logger.error(
+                    "Missing 'job' label in series %s",
+                    series.metric_name,
+                )
+                return 0
+            
             # Extract auid label (optional - use empty string if missing)
             auid = series.labels.get("auid", "")
             
-            # Build remaining labels JSON (exclude auid, biz_date, forecast)
-            excluded_labels = {"auid", "biz_date", "forecast"}
+            # Build remaining labels JSON (exclude job, auid, biz_date, forecast)
+            excluded_labels = {"job", "auid", "biz_date", "forecast"}
             remaining_labels = {
                 k: v for k, v in series.labels.items() 
                 if k not in excluded_labels
@@ -874,6 +883,7 @@ class MetricsForecastJob(BaseJob):
                         continue
                     
                     rows_to_insert.append({
+                        "job": job,
                         "biz_date": forecast_date,
                         "auid": auid,
                         "metric_name": series.metric_name,
@@ -893,16 +903,16 @@ class MetricsForecastJob(BaseJob):
             
             upsert_sql = text("""
                 INSERT INTO vm_forecasted_metric (
-                    biz_date, auid, metric_name, 
+                    job, biz_date, auid, metric_name, 
                     value, metric_labels, forecast_type,
                     created_at, updated_at
                 )
                 VALUES (
-                    :biz_date, :auid, :metric_name,
+                    :job, :biz_date, :auid, :metric_name,
                     :value, CAST(:metric_labels AS jsonb), :forecast_type,
                     :created_at, :updated_at
                 )
-                ON CONFLICT (biz_date, auid, metric_name, forecast_type)
+                ON CONFLICT (job, biz_date, auid, metric_name, forecast_type)
                 DO UPDATE SET
                     value = EXCLUDED.value,
                     metric_labels = EXCLUDED.metric_labels,
@@ -916,9 +926,10 @@ class MetricsForecastJob(BaseJob):
             conn.commit()
             
             self.logger.info(
-                "Wrote %s forecast rows for %s (auid=%s)",
+                "Wrote %s forecast rows for %s (job=%s, auid=%s)",
                 len(rows_to_insert),
                 series.metric_name,
+                job,
                 auid,
             )
             
