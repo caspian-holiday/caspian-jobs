@@ -576,17 +576,25 @@ class MetricsForecastJob(BaseJob):
         """
         selector = selector.strip()
 
-        # Replace placeholders if source_name is provided
-        if source_name:
+        # Replace placeholders if source_name is provided (and not None)
+        if source_name is not None and source_name != "":
             for placeholder in ("$JOB", "$SOURCE"):
                 if placeholder in selector:
                     selector = selector.replace(placeholder, source_name)
+        
+        # When source_name is None, remove any unreplaced placeholders to avoid invalid queries
+        if source_name is None:
+            if "$JOB" in selector or "$SOURCE" in selector:
+                self.logger.warning(
+                    "Selector contains placeholders but source_name is None: %s", 
+                    selector
+                )
 
         label_pattern = rf'{label_key}\s*=\s*"[^"]*"'
 
         def ensure_label(label_body: str) -> str:
-            # Add source label filter if source_name is provided
-            if source_name:
+            # Add source label filter ONLY if source_name is provided and not None
+            if source_name is not None and source_name != "":
                 if re.search(label_pattern, label_body):
                     label_body = re.sub(label_pattern, f'{label_key}="{source_name}"', label_body)
                 else:
@@ -601,16 +609,24 @@ class MetricsForecastJob(BaseJob):
         # Check for label-only selector first (more specific)
         if selector.startswith("{") and selector.endswith("}"):
             label_body = ensure_label(selector.strip("{}"))
-            return f"{{{label_body}}}"
+            # Ensure we don't return empty braces
+            if label_body:
+                return f"{{{label_body}}}"
+            else:
+                return selector  # Return original if label_body is empty
 
         # Check for metric name with labels
         if "{" in selector and selector.endswith("}"):
             metric_name, label_body = selector.split("{", 1)
             label_body = ensure_label(label_body.rstrip("}"))
-            return f"{metric_name}{{{label_body}}}"
+            # Only add braces if we have labels
+            if label_body:
+                return f"{metric_name}{{{label_body}}}"
+            else:
+                return metric_name  # Return just the metric name if no labels
 
         # For simple metric names without braces
-        if source_name:
+        if source_name is not None and source_name != "":
             return f'{selector}{{{label_key}="{source_name}"}}'
         else:
             return f'{selector}'
