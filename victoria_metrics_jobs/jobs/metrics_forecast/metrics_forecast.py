@@ -118,12 +118,14 @@ class MetricsForecastJob(BaseJob):
             job_config = self.get_job_config(job_id)
 
             source_job_names = self._normalize_list(job_config.get("source_job_names"))
-            if not source_job_names:
-                raise ValueError("source_job_names must be configured")
-
             metric_selectors = self._normalize_list(job_config.get("metric_selectors"))
+            
+            # At least one of source_job_names or metric_selectors must be provided
+            if not source_job_names and not metric_selectors:
+                raise ValueError("Either source_job_names or metric_selectors must be configured")
+            
+            # Default to wildcard selector if only source_job_names provided
             if not metric_selectors:
-                # Default to wildcard selector; job label restriction will keep it scoped
                 metric_selectors = ["{__name__!=\"\"}"]
 
             forecast_types = job_config.get("forecast_types") or [
@@ -271,10 +273,13 @@ class MetricsForecastJob(BaseJob):
 
             collected: List[SeriesHistory] = []
 
-            for source_name in state.source_job_names:
-                for selector in state.metric_selectors:
+            # Selection logic: use EITHER source_job_names OR metric_selectors (not both)
+            # Priority: source_job_names first, then metric_selectors
+            if state.source_job_names:
+                # Query by job names only (using wildcard selector)
+                for source_name in state.source_job_names:
                     query = self._build_metric_selector(
-                        selector, state.source_label, source_name
+                        "{__name__!=\"\"}", state.source_label, source_name
                     )
                     query_result = prom.custom_query_range(
                         query=query,
@@ -286,14 +291,36 @@ class MetricsForecastJob(BaseJob):
                         query_result, state.source_label, source_name
                     )
                     collected.extend(series)
+                
+                self.logger.info(
+                    "Collected %s metric series from %s source job(s)",
+                    len(collected),
+                    len(state.source_job_names),
+                )
+            else:
+                # Query by metric selectors only (no source label filtering)
+                for selector in state.metric_selectors:
+                    query = self._build_metric_selector(
+                        selector, state.source_label, source_name=None
+                    )
+                    query_result = prom.custom_query_range(
+                        query=query,
+                        start_time=start_dt,
+                        end_time=end_dt,
+                        step=step_str,
+                    )
+                    series = self._parse_range_query(
+                        query_result, state.source_label, source_name=None
+                    )
+                    collected.extend(series)
+                
+                self.logger.info(
+                    "Collected %s metric series from %s selector(s)",
+                    len(collected),
+                    len(state.metric_selectors),
+                )
 
             state.series_histories = collected
-            self.logger.info(
-                "Collected %s metric series across %s %s labels",
-                len(collected),
-                len(state.source_job_names),
-                state.source_label,
-            )
 
             return Ok(state)
         except Exception as exc:
@@ -535,32 +562,39 @@ class MetricsForecastJob(BaseJob):
         return []
 
     def _build_metric_selector(
-        self, selector: str, label_key: str, label_value: str
+        self, selector: str, label_key: str, source_name: Optional[str] = None
     ) -> str:
-        """Ensure the desired label is present in the selector (supports $JOB/$SOURCE)."""
+        """Build metric selector with optional source label filtering.
+        
+        Args:
+            selector: Base metric selector (supports $JOB/$SOURCE placeholders)
+            label_key: Source label key (e.g., 'source')
+            source_name: Optional source value to filter by. If None, no source filtering is applied.
+            
+        Returns:
+            PromQL selector with optional source filtering
+        """
         selector = selector.strip()
 
-        for placeholder in ("$JOB", "$SOURCE"):
-            if placeholder in selector:
-                selector = selector.replace(placeholder, label_value)
+        # Replace placeholders if source_name is provided
+        if source_name:
+            for placeholder in ("$JOB", "$SOURCE"):
+                if placeholder in selector:
+                    selector = selector.replace(placeholder, source_name)
 
         label_pattern = rf'{label_key}\s*=\s*"[^"]*"'
 
         def ensure_label(label_body: str) -> str:
-            if re.search(label_pattern, label_body):
-                label_body = re.sub(label_pattern, f'{label_key}="{label_value}"', label_body)
-            else:
-                label_body = label_body.strip()
-                if label_body:
-                    label_body = f'{label_body},{label_key}="{label_value}"'
+            # Add source label filter if source_name is provided
+            if source_name:
+                if re.search(label_pattern, label_body):
+                    label_body = re.sub(label_pattern, f'{label_key}="{source_name}"', label_body)
                 else:
-                    label_body = f'{label_key}="{label_value}"'
-            
-            # Exclude metrics with forecast label using PromQL regex negative match
-            # forecast!~".+" means "forecast does not match any non-empty string"
-            # This effectively matches only metrics where forecast label doesn't exist
-            if 'forecast!~' not in label_body:
-                label_body = f'{label_body},forecast!~".+"'
+                    label_body = label_body.strip()
+                    if label_body:
+                        label_body = f'{label_body},{label_key}="{source_name}"'
+                    else:
+                        label_body = f'{label_key}="{source_name}"'
             
             return label_body
 
@@ -573,22 +607,38 @@ class MetricsForecastJob(BaseJob):
             label_body = ensure_label(selector.strip("{}"))
             return f"{{{label_body}}}"
 
-        return f'{selector}{{{label_key}="{label_value}"}}'
+        # For simple metric names without braces
+        if source_name:
+            return f'{selector}{{{label_key}="{source_name}"}}'
+        else:
+            return f'{selector}'
 
     def _parse_range_query(
-        self, query_result: Any, label_key: str, label_value: str
+        self, query_result: Any, label_key: str, source_name: Optional[str] = None
     ) -> List[SeriesHistory]:
-        """Parse Prometheus range query response into SeriesHistory objects."""
+        """Parse Prometheus range query response into SeriesHistory objects.
+        
+        Args:
+            query_result: Prometheus query result
+            label_key: Source label key (e.g., 'source')
+            source_name: Optional source value. If None, extract from metric labels.
+            
+        Returns:
+            List of SeriesHistory objects
+        """
         if not query_result:
             return []
 
         if isinstance(query_result, dict):
             if query_result.get("status") != "success":
-                self.logger.warning(
-                    "Prometheus query unsuccessful for %s=%s",
-                    label_key,
-                    label_value,
-                )
+                if source_name:
+                    self.logger.warning(
+                        "Prometheus query unsuccessful for %s=%s",
+                        label_key,
+                        source_name,
+                    )
+                else:
+                    self.logger.warning("Prometheus query unsuccessful")
                 return []
             data = query_result.get("data", {})
             raw_series = data.get("result", [])
@@ -604,10 +654,19 @@ class MetricsForecastJob(BaseJob):
 
             labels = {k: v for k, v in metric.items() if k != "__name__"}
             
-            # Skip metrics that have a forecast label (these are generated forecasts)
-            # We exclude any metric with forecast label, regardless of its value
-            if "forecast" in labels:
-                continue
+            # Extract source value: use provided source_name or extract from labels
+            if source_name:
+                source_value = source_name
+            else:
+                # Extract source from metric labels (required for database storage)
+                source_value = labels.get(label_key)
+                if not source_value:
+                    self.logger.warning(
+                        "Skipping metric %s: missing required '%s' label",
+                        metric_name,
+                        label_key,
+                    )
+                    continue
             
             values = item.get("values", []) or []
             samples: List[Tuple[datetime, float]] = []
@@ -627,7 +686,7 @@ class MetricsForecastJob(BaseJob):
                     SeriesHistory(
                         metric_name=metric_name,
                         labels=labels,
-                        source_value=label_value,
+                        source_value=source_value,
                         samples=samples,
                     )
                 )
@@ -819,7 +878,7 @@ class MetricsForecastJob(BaseJob):
             if not conn:
                 raise ValueError("Database connection not available")
             
-            # Extract required labels
+            # Extract required source label
             source = series.labels.get(state.source_label)
             if not source:
                 self.logger.error(
@@ -829,13 +888,8 @@ class MetricsForecastJob(BaseJob):
                 )
                 return 0
             
-            auid = series.labels.get("auid")
-            if not auid:
-                self.logger.error(
-                    "Missing 'auid' label in series %s",
-                    series.metric_name,
-                )
-                return 0
+            # Extract auid label (optional - use empty string if missing)
+            auid = series.labels.get("auid", "")
             
             # Build remaining labels JSON (exclude source, auid, biz_date, forecast)
             excluded_labels = {state.source_label, "auid", "biz_date", "forecast"}
@@ -845,10 +899,14 @@ class MetricsForecastJob(BaseJob):
             }
             metric_labels_json = json.dumps(remaining_labels, sort_keys=True)
             
+            # Get current timestamp for all rows
+            current_timestamp = datetime.utcnow()
+            
             # Prepare rows for batch insert
             rows_to_insert = []
             
             for future_row in forecast_df.itertuples():
+                # Use forecast date as-is (biz_date from Prophet forecast)
                 forecast_date = future_row.ds.date()
                 
                 for forecast_type in state.forecast_types:
@@ -879,8 +937,6 @@ class MetricsForecastJob(BaseJob):
             
             # Build PostgreSQL upsert statement
             # ON CONFLICT ... DO UPDATE for idempotent writes
-            # Client supplies both created_at and updated_at timestamps
-            current_timestamp = datetime.utcnow()
             
             upsert_sql = text("""
                 INSERT INTO vm_forecast (
