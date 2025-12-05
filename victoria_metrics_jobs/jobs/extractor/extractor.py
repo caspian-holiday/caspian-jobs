@@ -538,10 +538,9 @@ class ExtractorJob(BaseJob):
                     labels = metric['metric']
                     
                     # Extract standard labels (similar to metrics_forecast job)
-                    # Support both 'auid' and 'audit_id' for backward compatibility
-                    auid = labels.get('auid') or labels.get('audit_id')
+                    auid = labels.get('auid')
                     if not auid:
-                        self.logger.warning(f"Metric {metric_name} missing auid/audit_id label, skipping")
+                        self.logger.warning(f"Metric {metric_name} missing auid label, skipping")
                         continue
                     
                     # Extract source (from 'job' label) and biz_date
@@ -558,7 +557,7 @@ class ExtractorJob(BaseJob):
                     
                     # Build remaining labels JSON (exclude standard labels)
                     # Similar pattern to metrics_forecast job
-                    excluded_labels = {'job', 'source', 'auid', 'audit_id', 'biz_date', '__name__'}
+                    excluded_labels = {'job', 'source', 'auid', 'biz_date', '__name__'}
                     remaining_labels = {
                         k: v for k, v in labels.items() 
                         if k not in excluded_labels
@@ -606,7 +605,7 @@ class ExtractorJob(BaseJob):
                         # Prepare metric record for batch insert
                         metric_record = {
                             'biz_date': biz_date if biz_date else weekday,  # Use extracted biz_date or fallback to weekday
-                            'metric_auid': auid,  # Renamed from audit_id
+                            'auid': auid,  # Renamed from audit_id
                             'metric_name': metric_name,
                             'value': value,
                             'timestamp': metric_timestamp,
@@ -626,11 +625,11 @@ class ExtractorJob(BaseJob):
                 if metric_records:
                     batch_insert_query = """
                     INSERT INTO vm_extracted_metrics (
-                        biz_date, metric_auid, metric_name, value, timestamp,
+                        biz_date, auid, metric_name, value, timestamp,
                         metric_labels, extracted_at, job_id, job_execution_timestamp
                     )
                     VALUES (
-                        :biz_date, :metric_auid, :metric_name, :value, :timestamp,
+                        :biz_date, :auid, :metric_name, :value, :timestamp,
                         CAST(:metric_labels AS jsonb), :extracted_at, :job_id, :job_execution_timestamp
                     )
                     """

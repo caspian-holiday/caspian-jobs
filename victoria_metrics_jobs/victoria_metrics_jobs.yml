@@ -129,8 +129,8 @@ environments:
         # Victoria Metrics configuration
         victoria_metrics: ${environments.local.victoria_metrics}
         # Converter-specific settings
-        source_job_names:
-          - apex_collector
+        metric_selectors:
+          - '{job="apex_collector"}'
         cutoff_hour: ${oc.env:VM_JOBS_BUSINESS_DATE_CONVERTER_CUTOFF_HOUR,6}
         watermark_lookback_days: ${oc.env:VM_JOBS_BUSINESS_DATE_CONVERTER_LOOKBACK_DAYS,30}
 
@@ -163,17 +163,19 @@ environments:
         #   connection_timeout: ${oc.env:VM_JOBS_FORECAST_DB_CONNECTION_TIMEOUT,10}
         # If forecast_database is not specified, fallback to common database
         database: ${environments.local.database}
-        source_job_names:
-          - apex_collector
-        source_label: source
-        metric_selectors:
-          - "{}"
-        history_days: 365
-        history_offset_days: 0
-        history_step_hours: 24
-        forecast_horizon_days: 20
-        min_history_points: 30
-        cutoff_hour: 6
+        # Legacy fields (no longer used as primary config - now database-driven)
+        # History and Prophet configuration is now stored in vm_forecast_config table
+        # source_job_names:
+        #   - apex_collector
+        # source_label: source
+        # metric_selectors:
+        #   - "{}"
+        # history_days: 365
+        # history_offset_days: 0
+        # history_step_hours: 24
+        # forecast_horizon_days: 20
+        # min_history_points: 30
+        # cutoff_hour: 6
         forecast_types:
           - name: trend
             field: yhat
@@ -181,11 +183,12 @@ environments:
             field: yhat_lower
           - name: upper
             field: yhat_upper
-        prophet:
-          weekly_seasonality: false
-          daily_seasonality: false
-          yearly_seasonality: true
-          seasonality_mode: additive
+        # Prophet configuration is now stored in vm_forecast_config table per selector
+        # prophet:
+        #   weekly_seasonality: false
+        #   daily_seasonality: false
+        #   yearly_seasonality: true
+        #   seasonality_mode: additive
         labels:
           env: local
 
@@ -314,8 +317,8 @@ environments:
         # Victoria Metrics configuration
         victoria_metrics: ${environments.dev.victoria_metrics}
         # Converter-specific settings
-        source_job_names:
-          - apex_collector
+        metric_selectors:
+          - '{job="apex_collector"}'
         cutoff_hour: ${oc.env:VM_JOBS_BUSINESS_DATE_CONVERTER_CUTOFF_HOUR,6}
         watermark_lookback_days: ${oc.env:VM_JOBS_BUSINESS_DATE_CONVERTER_LOOKBACK_DAYS,30}
 
@@ -348,17 +351,19 @@ environments:
         #   connection_timeout: ${oc.env:VM_JOBS_FORECAST_DB_CONNECTION_TIMEOUT,10}
         # If forecast_database is not specified, fallback to common database
         database: ${environments.dev.database}
-        source_job_names:
-          - apex_collector
-        source_label: source
-        metric_selectors:
-          - "{}"
-        history_days: 365
-        history_offset_days: 0
-        history_step_hours: 24
-        forecast_horizon_days: 20
-        min_history_points: 30
-        cutoff_hour: 6
+        # Legacy fields (no longer used as primary config - now database-driven)
+        # History and Prophet configuration is now stored in vm_forecast_config table
+        # source_job_names:
+        #   - apex_collector
+        # source_label: source
+        # metric_selectors:
+        #   - "{}"
+        # history_days: 365
+        # history_offset_days: 0
+        # history_step_hours: 24
+        # forecast_horizon_days: 20
+        # min_history_points: 30
+        # cutoff_hour: 6
         forecast_types:
           - name: trend
             field: yhat
@@ -366,10 +371,11 @@ environments:
             field: yhat_lower
           - name: upper
             field: yhat_upper
-        prophet:
-          weekly_seasonality: false
-          daily_seasonality: false
-          yearly_seasonality: true
-          seasonality_mode: additive
+        # Prophet configuration is now stored in vm_forecast_config table per selector
+        # prophet:
+        #   weekly_seasonality: false
+        #   daily_seasonality: false
+        #   yearly_seasonality: true
+        #   seasonality_mode: additive
         labels:
           env: dev

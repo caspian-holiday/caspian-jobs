@@ -27,8 +27,9 @@ class BusinessDateConverterState(BaseJobState):
     each step is executed. The state contains:
     
     - current_business_date: Derived business date for processing (UTC)
-    - source_job_names: List of job names to process
-    - job_watermarks: Mapping of job_name -> latest_timestamp processed
+    - metric_selectors: List of PromQL selector strings to process
+    - selector_watermarks: Mapping of selector -> latest_timestamp processed
+    - max_processed_timestamps: Mapping of selector -> max timestamp from input timeseries
     - metrics_processed: Count of metrics processed
     - metrics_converted: Count of metrics successfully converted
     - failed_count: Count of failed conversions
@@ -37,9 +38,9 @@ class BusinessDateConverterState(BaseJobState):
     - vm_token: Authentication token for VM
     """
     current_business_date: date = None
-    source_job_names: List[str] = None
-    job_watermarks: Dict[str, Optional[int]] = None
-    max_processed_timestamps: Dict[str, Optional[int]] = None  # Track max timestamp per job
+    metric_selectors: List[str] = None
+    selector_watermarks: Dict[str, Optional[int]] = None
+    max_processed_timestamps: Dict[str, Optional[int]] = None  # Track max timestamp per selector
     metrics_processed: int = 0
     metrics_converted: int = 0
     failed_count: int = 0
@@ -56,7 +57,7 @@ class BusinessDateConverterState(BaseJobState):
             'failed_count': self.failed_count,
             'success_rate': self.metrics_converted / max(self.metrics_processed, 1) * 100,
             'current_business_date': self.current_business_date.isoformat() if self.current_business_date else None,
-            'source_job_names': self.source_job_names
+            'metric_selectors': self.metric_selectors
         })
         return results
 
@@ -84,33 +85,36 @@ class BusinessDateConverterJob(BaseJob):
         """
         try:
             job_config = self.get_job_config(job_id)
-            source_job_names_raw = job_config.get('source_job_names', [])
+            metric_selectors_raw = job_config.get('metric_selectors', [])
             
             # Handle both list and string formats
-            if isinstance(source_job_names_raw, str):
+            if isinstance(metric_selectors_raw, str):
                 # Parse comma-separated string or JSON array string
                 import json
                 try:
-                    source_job_names = json.loads(source_job_names_raw)
+                    metric_selectors = json.loads(metric_selectors_raw)
                 except:
                     # Fallback to comma-separated
-                    source_job_names = [s.strip() for s in source_job_names_raw.split(',') if s.strip()]
-            elif isinstance(source_job_names_raw, list):
-                source_job_names = source_job_names_raw
+                    metric_selectors = [s.strip() for s in metric_selectors_raw.split(',') if s.strip()]
+            elif isinstance(metric_selectors_raw, list):
+                metric_selectors = metric_selectors_raw
             else:
-                source_job_names = []
+                metric_selectors = []
             
-            if not source_job_names:
-                raise ValueError("source_job_names must be configured")
+            if not metric_selectors:
+                raise ValueError("metric_selectors must be configured")
+            
+            # Normalize selectors: ensure double quotes (PromQL requires double quotes)
+            metric_selectors = [s.strip().replace("'", '"') for s in metric_selectors if s.strip()]
             
             initial_state = BusinessDateConverterState(
                 job_id=job_id,
                 job_config=job_config,
                 started_at=datetime.now(),
                 current_business_date=None,  # Will be updated in step 1
-                source_job_names=source_job_names,
-                job_watermarks={},  # Will be populated in step 2
-                max_processed_timestamps={},  # Will track max timestamp per job
+                metric_selectors=metric_selectors,
+                selector_watermarks={},  # Will be populated in step 2
+                max_processed_timestamps={},  # Will track max timestamp per selector
                 metrics_processed=0,
                 metrics_converted=0,
                 failed_count=0,
@@ -193,17 +197,19 @@ class BusinessDateConverterJob(BaseJob):
             self.logger.error(f"Failed to derive current business date: {e}")
             return Err(e)
     
-    # Step 2: Read job watermarks
+    # Step 2: Read selector watermarks
     def _read_job_watermarks(self, state: BusinessDateConverterState) -> Result[BusinessDateConverterState, Exception]:
-        """Read job watermarks from VictoriaMetrics to determine last processed timestamps.
+        """Read selector watermarks from VictoriaMetrics to determine last processed timestamps.
         
         Uses last_over_time() to look back in time (default 30 days) to find the latest
         watermark value, even if it hasn't been updated recently.
         """
         try:
+            import hashlib
+            
             if not state.vm_query_url:
                 self.logger.warning("No VM query URL configured, will process all metrics")
-                state.job_watermarks = {job: None for job in state.source_job_names}
+                state.selector_watermarks = {selector: None for selector in state.metric_selectors}
                 return Ok(state)
             
             # Get lookback period from config (default 30 days)
@@ -214,12 +220,14 @@ class BusinessDateConverterJob(BaseJob):
             # Initialize Prometheus client using helper method
             prom = self._get_prometheus_client(state)
             
-            job_watermarks = {}
-            for job_name in state.source_job_names:
+            selector_watermarks = {}
+            for selector in state.metric_selectors:
                 try:
-                    # Query for job watermark metric using last_over_time() to look back in time
+                    # Hash selector to create stable metric name for watermark
+                    selector_hash = hashlib.md5(selector.encode()).hexdigest()
+                    # Query for selector watermark metric using last_over_time() to look back in time
                     # This ensures we get the latest value even if it's old
-                    watermark_metric = f'latest_converted_timestamp_by_job_wm{{source="{job_name}"}}'
+                    watermark_metric = f'latest_converted_timestamp_by_selector_wm{{selector_hash="{selector_hash}"}}'
                     promql_query = f'last_over_time({watermark_metric}[{lookback_duration}])'
                     
                     # Query using PromQL instant query
@@ -230,36 +238,36 @@ class BusinessDateConverterJob(BaseJob):
                         result = query_result[0]
                         if 'value' in result and result['value']:
                             timestamp = float(result['value'][1])  # Prometheus format: [timestamp, value]
-                            job_watermarks[job_name] = int(timestamp)
+                            selector_watermarks[selector] = int(timestamp)
                             self.logger.info(
-                                f"Job watermark for {job_name}: {job_watermarks[job_name]} "
+                                f"Selector watermark for {selector}: {selector_watermarks[selector]} "
                                 f"(found looking back {watermark_lookback_days} days)"
                             )
                         else:
-                            job_watermarks[job_name] = None
+                            selector_watermarks[selector] = None
                             self.logger.info(
-                                f"No watermark found for job {job_name} "
+                                f"No watermark found for selector {selector} "
                                 f"(searched back {watermark_lookback_days} days)"
                             )
                     else:
-                        job_watermarks[job_name] = None
+                        selector_watermarks[selector] = None
                         self.logger.info(
-                            f"No watermark found for job {job_name} "
+                            f"No watermark found for selector {selector} "
                             f"(searched back {watermark_lookback_days} days)"
                         )
                         
                 except Exception as e:
                     self.logger.warning(
-                        f"Failed to read watermark for job {job_name} "
+                        f"Failed to read watermark for selector {selector} "
                         f"(lookback {watermark_lookback_days} days): {e}"
                     )
-                    job_watermarks[job_name] = None
+                    selector_watermarks[selector] = None
             
-            state.job_watermarks = job_watermarks
+            state.selector_watermarks = selector_watermarks
             return Ok(state)
             
         except Exception as e:
-            self.logger.error(f"Failed to read job watermarks: {e}")
+            self.logger.error(f"Failed to read selector watermarks: {e}")
             return Err(e)
     
     # Step 3: Query updated metrics and convert
@@ -273,13 +281,13 @@ class BusinessDateConverterJob(BaseJob):
             # Initialize Prometheus client using helper method
             prom = self._get_prometheus_client(state)
             
-            # Process each job
-            for job_name in state.source_job_names:
+            # Process each selector
+            for selector in state.metric_selectors:
                 try:
-                    self.logger.info(f"Processing metrics for job: {job_name}")
+                    self.logger.info(f"Processing metrics for selector: {selector}")
                     
-                    # Get watermark for this job
-                    watermark_ts = state.job_watermarks.get(job_name)
+                    # Get watermark for this selector
+                    watermark_ts = state.selector_watermarks.get(selector)
                     
                     # Calculate time range: from watermark to now
                     if watermark_ts:
@@ -290,31 +298,31 @@ class BusinessDateConverterJob(BaseJob):
                         # Calculate start_time as lookback_days ago from now
                         end_time = datetime.now(timezone.utc)
                         start_time = end_time - timedelta(days=lookback_days)
-                        self.logger.info(f"No watermark found for job {job_name}, using lookback of {lookback_days} days from {end_time} to {start_time}")
+                        self.logger.info(f"No watermark found for selector {selector}, using lookback of {lookback_days} days from {end_time} to {start_time}")
                     
                     if watermark_ts:
                         end_time = datetime.now(timezone.utc)
                     
-                    self.logger.info(f"Querying metrics for job {job_name} from {start_time} to {end_time}")
+                    self.logger.info(f"Querying metrics for selector {selector} from {start_time} to {end_time}")
                     
                     # Query metrics using export API to get latest value per series+business_date with actual timestamps
-                    grouped_metrics, max_timestamp_from_inputs = self._query_grouped_metrics(state, prom, job_name, start_time, end_time)
+                    grouped_metrics, max_timestamp_from_inputs = self._query_grouped_metrics(state, prom, selector, start_time, end_time)
                     
-                    self.logger.info(f"Found {len(grouped_metrics)} unique metric series+business_date combinations for job {job_name}")
+                    self.logger.info(f"Found {len(grouped_metrics)} unique metric series+business_date combinations for selector {selector}")
                     
                     # Store the max timestamp from all input timeseries for watermark
                     # This represents the latest timestamp seen on any input timeseries
                     # Only set if we actually found input data; clear if no data found
                     if max_timestamp_from_inputs is not None:
-                        state.max_processed_timestamps[job_name] = max_timestamp_from_inputs
+                        state.max_processed_timestamps[selector] = max_timestamp_from_inputs
                         self.logger.info(
-                            f"Latest timestamp from all input timeseries for {job_name}: {max_timestamp_from_inputs}"
+                            f"Latest timestamp from all input timeseries for {selector}: {max_timestamp_from_inputs}"
                         )
                     else:
                         # Clear any previous value to prevent watermark update when no input found
-                        state.max_processed_timestamps.pop(job_name, None)
+                        state.max_processed_timestamps.pop(selector, None)
                         self.logger.info(
-                            f"No input data found for job {job_name}, "
+                            f"No input data found for selector {selector}, "
                             "cleared max_processed_timestamps to prevent watermark update"
                         )
                     
@@ -323,6 +331,12 @@ class BusinessDateConverterJob(BaseJob):
                         try:
                             # Convert labels_tuple back to dict
                             labels_without_biz_date = dict(labels_tuple)
+                            
+                            # Extract job from labels (job label is always present)
+                            job = labels_without_biz_date.get('job')
+                            if not job:
+                                self.logger.warning(f"Missing 'job' label in metric {metric_name}, skipping")
+                                continue
                             
                             # Parse biz_date - format is "dd/mm/yyyy"
                             try:
@@ -336,12 +350,12 @@ class BusinessDateConverterJob(BaseJob):
                             
                             # Calculate converted timestamp
                             converted_ts = self._calculate_converted_timestamp(
-                                state, prom, metric_name, business_date, job_name, labels_without_biz_date
+                                state, prom, metric_name, business_date, labels_without_biz_date
                             )
                             
                             # Transform and write metric
                             success = self._write_converted_metric(
-                                state, metric_name, labels_without_biz_date, job_name,
+                                state, metric_name, labels_without_biz_date,
                                 business_date, value, converted_ts
                             )
                             
@@ -358,7 +372,7 @@ class BusinessDateConverterJob(BaseJob):
                             state.metrics_processed += 1
                     
                 except Exception as e:
-                    self.logger.error(f"Failed to process job {job_name}: {e}")
+                    self.logger.error(f"Failed to process selector {selector}: {e}")
                     state.failed_count += 1
             
             self.logger.info(f"Conversion complete: {state.metrics_converted} converted, {state.failed_count} failed")
@@ -369,12 +383,19 @@ class BusinessDateConverterJob(BaseJob):
             return Err(e)
     
     def _query_grouped_metrics(
-        self, state: BusinessDateConverterState, prom: PrometheusConnect, job_name: str, start_time: datetime, end_time: datetime
+        self, state: BusinessDateConverterState, prom: PrometheusConnect, selector: str, start_time: datetime, end_time: datetime
     ) -> Tuple[Dict[Tuple[str, tuple, str], Tuple[float, float]], Optional[int]]:
         """Query metrics from VM using export API to get latest value per series+business_date with actual timestamps.
         
         Uses Victoria Metrics /api/v1/export endpoint to get raw data points with actual timestamps.
         Groups metrics locally by series+business_date and keeps the latest value per group based on actual timestamp.
+        
+        Args:
+            state: Job state
+            prom: Prometheus client
+            selector: PromQL selector string
+            start_time: Start time for query
+            end_time: End time for query
         
         Returns:
             Tuple of:
@@ -413,7 +434,8 @@ class BusinessDateConverterJob(BaseJob):
             
             # Build export query parameters
             # The export endpoint uses match[] parameter for metric selector
-            base_query = f'{{job="{job_name}"}}'
+            # Normalize selector: ensure double quotes (PromQL requires double quotes)
+            base_query = selector.strip().replace("'", '"')
             params = {
                 "match[]": base_query,
                 "start": int(start_time.timestamp()),
@@ -495,11 +517,10 @@ class BusinessDateConverterJob(BaseJob):
             # Return empty dict on error
         
         return grouped, int(max_timestamp) if max_timestamp is not None else None
-        return grouped, int(max_timestamp) if max_timestamp is not None else None
     
     def _calculate_converted_timestamp(
         self, state: BusinessDateConverterState, prom: PrometheusConnect,
-        metric_name: str, business_date: date, job_name: str, labels_without_biz_date: Dict[str, str]
+        metric_name: str, business_date: date, labels_without_biz_date: Dict[str, str]
     ) -> int:
         """Calculate converted timestamp for a metric+business_date combination.
         
@@ -508,14 +529,19 @@ class BusinessDateConverterJob(BaseJob):
         If entry exists, returns max existing timestamp + 1 second offset.
         """
         try:
+            # Extract job from labels (job label is always present)
+            job = labels_without_biz_date.get('job')
+            if not job:
+                self.logger.warning(f"Missing 'job' label when calculating timestamp for {metric_name}, using midnight")
+                midnight = datetime.combine(business_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+                return int(midnight.timestamp())
+            
             # Build query for the converted metric series (same as how it's written)
-            # Converted metrics have: same metric_name, labels without biz_date, source instead of job
+            # Converted metrics have: same metric_name, labels without biz_date, job label kept as-is, timeseries_type="converted"
             converted_labels = labels_without_biz_date.copy()
             converted_labels.pop('biz_date', None)  # Remove biz_date if present
-            if 'job' in converted_labels:
-                converted_labels['source'] = converted_labels.pop('job')
-            else:
-                converted_labels['source'] = job_name
+            # job label is always present on input, keep it as-is
+            converted_labels['timeseries_type'] = 'converted'
             
             # Build PromQL query for the converted metric series
             label_pairs = [f'{k}="{v}"' for k, v in sorted(converted_labels.items())]
@@ -719,20 +745,24 @@ class BusinessDateConverterJob(BaseJob):
     
     def _write_converted_metric(
         self, state: BusinessDateConverterState, metric_name: str,
-        labels_without_biz_date: Dict[str, str], job_name: str, business_date: date,
+        labels_without_biz_date: Dict[str, str], business_date: date,
         value: float, timestamp: int
     ) -> bool:
         """Write converted metric to Victoria Metrics."""
         try:
+            # Extract job from labels (job label is always present)
+            job = labels_without_biz_date.get('job')
+            if not job:
+                self.logger.error(f"Missing 'job' label when writing converted metric {metric_name}")
+                return False
+            
             # Copy labels and transform
             labels_dict = labels_without_biz_date.copy()
             
-            # Remove biz_date if present (it's already removed, but check for safety), convert job to source
+            # Remove biz_date if present (it's already removed, but check for safety)
+            # job label is always present on input, keep it as-is
             labels_dict.pop('biz_date', None)
-            if 'job' in labels_dict:
-                labels_dict['source'] = labels_dict.pop('job')
-            else:
-                labels_dict['source'] = job_name
+            labels_dict['timeseries_type'] = 'converted'
             
             # Build metric line in Prometheus format
             label_pairs = [f'{k}="{v}"' for k, v in sorted(labels_dict.items())]
@@ -747,43 +777,47 @@ class BusinessDateConverterJob(BaseJob):
     
     # Step 4: Update job watermarks
     def _update_job_watermarks(self, state: BusinessDateConverterState) -> Result[BusinessDateConverterState, Exception]:
-        """Update job watermarks with latest processed timestamps.
+        """Update selector watermarks with latest processed timestamps.
         
         Only updates watermarks if we actually found input data (max_ts is not None).
         This prevents updating the watermark when no new input data was found.
         """
         try:
+            import hashlib
+            
             if not state.vm_gateway_url:
                 self.logger.warning("No VM gateway URL configured, skipping watermark update")
                 return Ok(state)
             
             # Update watermarks with max processed timestamps
-            for job_name in state.source_job_names:
+            for selector in state.metric_selectors:
                 try:
                     # Only update watermark if we found input data
-                    max_ts = state.max_processed_timestamps.get(job_name)
+                    max_ts = state.max_processed_timestamps.get(selector)
                     if max_ts is None:
                         self.logger.info(
-                            f"No input data found for job {job_name}, "
+                            f"No input data found for selector {selector}, "
                             "skipping watermark update"
                         )
                         continue
                     
-                    watermark_line = f'latest_converted_timestamp_by_job_wm{{source="{job_name}"}} {max_ts} {max_ts}'
+                    # Hash selector to create stable metric name for watermark (same as in _read_job_watermarks)
+                    selector_hash = hashlib.md5(selector.encode()).hexdigest()
+                    watermark_line = f'latest_converted_timestamp_by_selector_wm{{selector_hash="{selector_hash}"}} {max_ts} {max_ts}'
                     
                     # Write watermark using Prometheus client session
                     if self._write_metric_to_vm(state, watermark_line, timeout=30):
-                        self.logger.info(f"Updated job watermark for {job_name} to {max_ts}")
+                        self.logger.info(f"Updated selector watermark for {selector} to {max_ts}")
                     else:
                         raise Exception("Failed to write watermark metric")
                     
                 except Exception as e:
-                    self.logger.warning(f"Failed to update job watermark for {job_name}: {e}")
+                    self.logger.warning(f"Failed to update selector watermark for {selector}: {e}")
             
             return Ok(state)
             
         except Exception as e:
-            self.logger.error(f"Failed to update job watermarks: {e}")
+            self.logger.error(f"Failed to update selector watermarks: {e}")
             return Err(e)
     
     # Step 5: Publish job status metric
