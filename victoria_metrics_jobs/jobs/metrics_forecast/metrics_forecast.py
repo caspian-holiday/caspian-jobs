@@ -11,17 +11,18 @@ The job:
 5. Publishes job status metric to VictoriaMetrics
 
 Database Storage:
-- Forecasts are stored in a PostgreSQL 'vm_forecasted_metric' table
-- Primary key: (job, biz_date, auid, metric_name, forecast_type)
+- Forecasts are stored in PostgreSQL 'vm_metric_data' and 'vm_metric_metadata' tables
+- Metadata table (vm_metric_metadata): stores job_idx, metric_id, job_id, metric_name, metric_labels
+- Data table (vm_metric_data): stores job_idx, metric_id, metric_timestamp, metric_value
+- Primary key: (job_idx, metric_id, metric_timestamp)
 - Re-running forecasts overwrites existing values (idempotent)
-- Table is partitioned by job for better performance
+- Job labels are transformed by adding "_forecast" suffix
 """
 
 from __future__ import annotations
 
 import gc
 import json
-import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -407,493 +408,6 @@ class MetricsForecastJob(BaseJob):
             self.logger.error("Failed to process forecast configurations: %s", exc)
             return Err(exc)
 
-    # OLD Step 2: Load per-selection Prophet configurations from database
-    def _load_selection_configs(
-        self, state: MetricsForecastState
-    ) -> Result[MetricsForecastState, Exception]:
-        """Load per-selection Prophet configuration from database.
-        
-        Loads configuration overrides for specific jobs or selectors from the
-        vm_forecast_config table. These configs override default YAML settings
-        for specific metric selections.
-        
-        Format of selection_configs:
-            {('job', 'extractor'): {'prophet_params': {...}, 'prophet_fit_params': {...}}}
-        """
-        try:
-            # Try to get database connection - fail gracefully if not available
-            conn = self._get_database_connection(state)
-            if not conn:
-                self.logger.warning(
-                    "Database connection not available - using default Prophet config for all selections"
-                )
-                return Ok(state)
-            
-            # Query for enabled configurations
-            query = text("""
-                SELECT selection_type, selection_value, prophet_params, prophet_fit_params
-                FROM vm_forecast_config
-                WHERE enabled = true
-            """)
-            
-            try:
-                result = conn.execute(query)
-                rows = result.fetchall()
-                
-                # Parse and store configurations
-                for row in rows:
-                    selection_type = row[0]
-                    selection_value = row[1]
-                    prophet_params = row[2]  # Already parsed as dict by JSONB
-                    prophet_fit_params = row[3]  # Already parsed as dict by JSONB
-                    
-                    config_key = (selection_type, selection_value)
-                    config_value = {}
-                    
-                    if prophet_params:
-                        config_value['prophet_params'] = dict(prophet_params)
-                    if prophet_fit_params:
-                        config_value['prophet_fit_params'] = dict(prophet_fit_params)
-                    
-                    state.selection_configs[config_key] = config_value
-                    
-                    self.logger.info(
-                        "Loaded custom config for %s='%s': %s",
-                        selection_type,
-                        selection_value,
-                        config_value,
-                    )
-                
-                if state.selection_configs:
-                    self.logger.info(
-                        "Loaded %s custom Prophet configurations from database",
-                        len(state.selection_configs),
-                    )
-                else:
-                    self.logger.info(
-                        "No custom Prophet configurations found - using defaults for all selections"
-                    )
-                
-            except Exception as query_exc:
-                # If table doesn't exist or query fails, log warning and continue with defaults
-                self.logger.warning(
-                    "Failed to load selection configs from database (table may not exist): %s. "
-                    "Using default config for all selections.",
-                    query_exc,
-                )
-            
-            return Ok(state)
-            
-        except Exception as exc:
-            # Non-critical error - log and continue with default configs
-            self.logger.warning(
-                "Error loading selection configs: %s. Using default config for all selections.",
-                exc,
-            )
-            return Ok(state)
-
-    # Step 3: Create forecast run records upfront based on configuration
-    def _create_forecast_runs(
-        self, state: MetricsForecastState
-    ) -> Result[MetricsForecastState, Exception]:
-        """Create forecast run records for each selection before collecting series.
-        
-        This creates run records upfront based on what we're configured to query,
-        rather than discovering unique selections after series collection.
-        
-        Benefits:
-        - No need to group/deduplicate series later
-        - Run records exist even if query returns no series
-        - Simpler, more predictable code
-        """
-        try:
-            # Determine selections based on configuration
-            if state.source_job_names:
-                # Create run record for each configured job
-                for job_name in state.source_job_names:
-                    config_key = ("job", job_name)
-                    selection_config = state.selection_configs.get(config_key, {})
-                    
-                    # Merge prophet config (defaults + per-selection)
-                    prophet_config = dict(state.prophet_config)
-                    if 'prophet_params' in selection_config:
-                        prophet_config.update(selection_config['prophet_params'])
-                    
-                    # Merge prophet fit config
-                    prophet_fit_config = dict(state.prophet_fit_kwargs)
-                    if 'prophet_fit_params' in selection_config:
-                        prophet_fit_config.update(selection_config['prophet_fit_params'])
-                    
-                    # Determine config source
-                    config_source = f"job={job_name}" if selection_config else "default"
-                    
-                    # Create run record
-                    run_id = self._create_forecast_run_record(
-                        state,
-                        "job",
-                        job_name,
-                        prophet_config,
-                        prophet_fit_config,
-                        config_source,
-                    )
-                    
-                    if run_id:
-                        state.forecast_run_ids[config_key] = run_id
-                        self.logger.info(
-                            "Created forecast run %s for job='%s' with config_source='%s'",
-                            run_id,
-                            job_name,
-                            config_source,
-                        )
-                
-                self.logger.info(
-                    "Created %s forecast run record(s) for source jobs",
-                    len(state.forecast_run_ids),
-                )
-            
-            else:
-                # Create run record for each configured selector
-                for selector in state.metric_selectors:
-                    config_key = ("selector", selector)
-                    selection_config = state.selection_configs.get(config_key, {})
-                    
-                    # Merge prophet config
-                    prophet_config = dict(state.prophet_config)
-                    if 'prophet_params' in selection_config:
-                        prophet_config.update(selection_config['prophet_params'])
-                    
-                    # Merge prophet fit config
-                    prophet_fit_config = dict(state.prophet_fit_kwargs)
-                    if 'prophet_fit_params' in selection_config:
-                        prophet_fit_config.update(selection_config['prophet_fit_params'])
-                    
-                    # Determine config source
-                    config_source = f"selector={selector}" if selection_config else "default"
-                    
-                    # Create run record
-                    run_id = self._create_forecast_run_record(
-                        state,
-                        "selector",
-                        selector,
-                        prophet_config,
-                        prophet_fit_config,
-                        config_source,
-                    )
-                    
-                    if run_id:
-                        state.forecast_run_ids[config_key] = run_id
-                        self.logger.info(
-                            "Created forecast run %s for selector='%s' with config_source='%s'",
-                            run_id,
-                            selector,
-                            config_source,
-                        )
-                
-                self.logger.info(
-                    "Created %s forecast run record(s) for selectors",
-                    len(state.forecast_run_ids),
-                )
-            
-            return Ok(state)
-            
-        except Exception as exc:
-            self.logger.error("Failed to create forecast runs: %s", exc)
-            return Err(exc)
-
-    # Step 4: Collect historical samples per series
-    def _collect_metric_histories(
-        self, state: MetricsForecastState
-    ) -> Result[MetricsForecastState, Exception]:
-        try:
-            if not state.current_business_date:
-                raise ValueError("current_business_date must be computed first")
-
-            prom = self._get_prometheus_client(state)
-            if prom is None:
-                raise ValueError("Prometheus client could not be initialized")
-
-            history_end = state.current_business_date - timedelta(days=state.history_offset_days)
-            history_start = history_end - timedelta(days=state.history_days)
-            state.history_start_date = history_start
-            state.history_end_date = history_end
-
-            start_dt = datetime.combine(history_start, datetime.min.time()).replace(tzinfo=timezone.utc)
-            end_dt = datetime.combine(history_end, datetime.max.time()).replace(tzinfo=timezone.utc)
-            step_str = f"{state.history_step_hours}h"
-
-            collected: List[SeriesHistory] = []
-
-            # Selection logic: use EITHER source_job_names OR metric_selectors (not both)
-            # Priority: source_job_names first, then metric_selectors
-            if state.source_job_names:
-                # Query by job names only (using wildcard selector with job label filter)
-                for job_name in state.source_job_names:
-                    query = self._build_metric_selector(
-                        "{__name__!=\"\"}", "job", job_name
-                    )
-                    self.logger.debug("Executing query for job=%s: %s", job_name, query)
-                    query_result = prom.custom_query_range(
-                        query=query,
-                        start_time=start_dt,
-                        end_time=end_dt,
-                        step=step_str,
-                    )
-                    # Track selection source for Prophet config lookup
-                    series = self._parse_range_query(
-                        query_result, 
-                        selection_type="job", 
-                        selection_value=job_name
-                    )
-                    collected.extend(series)
-                
-                self.logger.info(
-                    "Collected %s metric series from %s job(s)",
-                    len(collected),
-                    len(state.source_job_names),
-                )
-            else:
-                # Query by metric selectors only (use selectors as-is, no modification)
-                for selector in state.metric_selectors:
-                    # Normalize selector: PromQL requires double quotes for label values
-                    # Replace single quotes with double quotes for label matchers
-                    query = selector.strip().replace("'", '"')
-                    self.logger.debug("Executing selector query: %s", query)
-                    query_result = prom.custom_query_range(
-                        query=query,
-                        start_time=start_dt,
-                        end_time=end_dt,
-                        step=step_str,
-                    )
-                    # Track selection source for Prophet config lookup
-                    series = self._parse_range_query(
-                        query_result,
-                        selection_type="selector",
-                        selection_value=selector
-                    )
-                    collected.extend(series)
-                
-                self.logger.info(
-                    "Collected %s metric series from %s selector(s)",
-                    len(collected),
-                    len(state.metric_selectors),
-                )
-
-            state.series_histories = collected
-
-            return Ok(state)
-        except Exception as exc:
-            self.logger.error("Failed to collect metric histories: %s", exc)
-            return Err(exc)
-
-    # Step 5: Train Prophet models and write forecasts to database
-    def _forecast_and_publish(
-        self, state: MetricsForecastState
-    ) -> Result[MetricsForecastState, Exception]:
-        try:
-            if not state.series_histories:
-                self.logger.warning("No metric series discovered for forecasting")
-                return Ok(state)
-
-            # Initialize database connection
-            conn = self._get_database_connection(state)
-            if conn is None:
-                raise ValueError("Database connection could not be established")
-            
-            # Still need Prometheus client for history collection (already done in step 2)
-            prom = self._get_prometheus_client(state)
-            if prom is None:
-                raise ValueError("Prometheus client could not be initialized")
-
-            # Note: Forecast run records are already created in _create_forecast_runs step
-            # Each series should already have a run_id available in state.forecast_run_ids
-
-            for series_idx, series in enumerate(state.series_histories):
-                try:
-                    # Add small delay between series to avoid resource contention
-                    if series_idx > 0:
-                        time.sleep(0.5)  # 500ms delay between series
-                    
-                    training_df = self._prepare_training_frame(series.samples)
-                    if len(training_df) < state.min_history_points:
-                        self.logger.info(
-                            "Skipping %s due to insufficient history (%s < %s)",
-                            series.metric_name,
-                            len(training_df),
-                            state.min_history_points,
-                        )
-                        continue
-                    
-                    # Validate training data before fitting
-                    if training_df.empty or training_df["y"].isna().all():
-                        self.logger.warning(
-                            "Skipping %s: training data is empty or all NaN",
-                            series.metric_name,
-                        )
-                        continue
-                    
-                    # Check for infinite or extremely large values that could crash Stan
-                    if np.isinf(training_df["y"]).any():
-                        self.logger.warning(
-                            "Skipping %s: training data contains infinite values",
-                            series.metric_name,
-                        )
-                        continue
-                    
-                    # Prophet can handle NaNs by dropping those rows, but we need enough valid points
-                    # Count non-NaN values to ensure we have sufficient data after Prophet drops NaNs
-                    valid_points = training_df["y"].notna().sum()
-                    if valid_points < state.min_history_points:
-                        self.logger.warning(
-                            "Skipping %s: insufficient valid data points (%s < %s) after accounting for NaNs",
-                            series.metric_name,
-                            valid_points,
-                            state.min_history_points,
-                        )
-                        continue
-                    
-                    # Warn about very large datasets that might cause memory issues
-                    if len(training_df) > 10000:
-                        self.logger.warning(
-                            "Large dataset for %s (%s points) may cause memory issues with cmdstanpy. "
-                            "Consider reducing history_days if crashes occur.",
-                            series.metric_name,
-                            len(training_df),
-                        )
-                    
-                    # Log if there are NaNs (Prophet will drop them automatically)
-                    nan_count = training_df["y"].isna().sum()
-                    if nan_count > 0:
-                        self.logger.debug(
-                            "Series %s has %s NaN values (out of %s total); Prophet will drop these rows",
-                            series.metric_name,
-                            nan_count,
-                            len(training_df),
-                        )
-                    
-                    # Additional data validation
-                    # Check for constant values which can cause Stan compilation issues
-                    valid_y = training_df["y"].dropna()
-                    if len(valid_y) > 0:
-                        value_std = valid_y.std()
-                        if value_std == 0 or np.isnan(value_std):
-                            self.logger.warning(
-                                "Skipping %s: constant or invalid values (std=%s) may cause Stan issues",
-                                series.metric_name,
-                                value_std,
-                            )
-                            continue
-                        
-                        # Check for extreme value ranges that might cause numerical issues
-                        value_range = valid_y.max() - valid_y.min()
-                        if value_range > 1e10:
-                            self.logger.warning(
-                                "Skipping %s: extremely large value range (%s) may cause numerical instability",
-                                series.metric_name,
-                                value_range,
-                            )
-                            continue
-
-                    # Get merged Prophet fit kwargs (defaults + per-selection overrides)
-                    prophet_fit_kwargs = dict(state.prophet_fit_kwargs)
-                    if series.selection_type and series.selection_value:
-                        config_key = (series.selection_type, series.selection_value)
-                        selection_config = state.selection_configs.get(config_key)
-                        if selection_config and 'prophet_fit_params' in selection_config:
-                            prophet_fit_kwargs.update(selection_config['prophet_fit_params'])
-
-                    model = self._create_prophet_model(state, series)
-                    
-                    # Fit Prophet model with retry logic for cmdstanpy stability
-                    max_retries = 3
-                    fit_success = False
-                    last_error = None
-                    
-                    for attempt in range(max_retries):
-                        try:
-                            model.fit(training_df, **prophet_fit_kwargs)
-                            fit_success = True
-                            break
-                        except Exception as fit_error:
-                            last_error = fit_error
-                            error_msg = str(fit_error)
-                            
-                            if attempt < max_retries - 1:
-                                wait_seconds = (2 ** attempt) + 1  # Exponential backoff, min 2s
-                                self.logger.warning(
-                                    "Prophet fit failed (attempt %s/%s) for %s: %s. "
-                                    "Retrying in %s seconds...",
-                                    attempt + 1,
-                                    max_retries,
-                                    series.metric_name,
-                                    error_msg[:200],
-                                    wait_seconds,
-                                )
-                                time.sleep(wait_seconds)
-                                
-                                # Cleanup before retry
-                                del model
-                                gc.collect()
-                                time.sleep(0.5)  # Additional small delay for cleanup
-                                
-                                # Recreate model for retry to clear any corrupted state
-                                model = self._create_prophet_model(state, series)
-                            else:
-                                self.logger.error(
-                                    "Prophet fit failed after %s attempts for %s: %s",
-                                    max_retries,
-                                    series.metric_name,
-                                    error_msg[:200],
-                                )
-                                raise
-                    
-                    if not fit_success:
-                        raise Exception(f"Prophet fit failed after {max_retries} attempts: {last_error}")
-
-                    last_history_date = training_df["ds"].max().date()
-                    future_dates = self._future_business_dates(
-                        last_history_date, state.forecast_horizon_days
-                    )
-                    if not future_dates:
-                        continue
-
-                    future_df = pd.DataFrame({"ds": future_dates})
-                    forecast_df = model.predict(future_df)
-
-                    # Get forecast run_id for this series
-                    forecast_run_id = None
-                    if series.selection_type and series.selection_value:
-                        config_key = (series.selection_type, series.selection_value)
-                        forecast_run_id = state.forecast_run_ids.get(config_key)
-
-                    # Write forecasts to database with run reference
-                    rows_written = self._write_forecasts_to_database(
-                        state, series, forecast_df, forecast_run_id
-                    )
-                    
-                    if rows_written > 0:
-                        state.forecasts_written += rows_written
-
-                    state.series_processed += 1
-                    
-                    # Clean up model to free memory
-                    del model
-                    gc.collect()
-
-                except Exception as series_exc:
-                    state.failed_series += 1
-                    self.logger.error(
-                        "Failed to forecast series %s labels=%s: %s",
-                        series.metric_name,
-                        series.labels,
-                        series_exc,
-                    )
-                    # Clean up memory on failure
-                    gc.collect()
-
-            return Ok(state)
-        except Exception as exc:
-            self.logger.error("Failed to generate forecasts: %s", exc)
-            return Err(exc)
 
     # Step 6: Publish status metric for observability
     def _publish_job_status_metric(
@@ -1195,59 +709,6 @@ class MetricsForecastJob(BaseJob):
             future_dates.append(pd.Timestamp(candidate))
         return future_dates
 
-    def _create_prophet_model(
-        self, 
-        state: MetricsForecastState, 
-        series: Optional[SeriesHistory] = None
-    ) -> Prophet:
-        """Create Prophet model with config precedence: defaults → YAML → per-selection DB config.
-        
-        Args:
-            state: Job state with default Prophet config and selection configs from DB
-            series: Optional series to lookup per-selection config
-            
-        Returns:
-            Prophet model instance with merged configuration
-        """
-        # Start with default config from YAML
-        prophet_config = dict(state.prophet_config)
-        config_source = "default"
-        
-        # Check for per-selection override from database
-        if series and series.selection_type and series.selection_value:
-            config_key = (series.selection_type, series.selection_value)
-            selection_config = state.selection_configs.get(config_key)
-            
-            if selection_config:
-                # Merge per-selection prophet_params over defaults
-                if 'prophet_params' in selection_config:
-                    prophet_config.update(selection_config['prophet_params'])
-                    config_source = f"{series.selection_type}={series.selection_value}"
-                    self.logger.debug(
-                        "Using custom Prophet config for %s='%s': %s",
-                        series.selection_type,
-                        series.selection_value,
-                        selection_config['prophet_params'],
-                    )
-        
-        # Create model with merged config
-        model = Prophet(**prophet_config)
-        
-        # Some downstream environments ship Prophet builds that forget to set this attribute.
-        if not hasattr(model, "stan_backend"):
-            model.stan_backend = None  # Prophet.fit() will populate a backend when None
-            self.logger.debug("Prophet instance missing stan_backend attribute; initialized to None")
-        
-        # Log which config is being used
-        if series:
-            self.logger.info(
-                "Created Prophet model for %s (config_source=%s)",
-                series.metric_name,
-                config_source,
-            )
-        
-        return model
-
     def _create_forecast_run_record(
         self,
         state: MetricsForecastState,
@@ -1458,6 +919,230 @@ class MetricsForecastJob(BaseJob):
         except Exception as exc:
             self.logger.warning("Error closing database connection: %s", exc)
 
+    def _normalize_metric_labels_for_comparison(self, labels: Dict[str, str]) -> str:
+        """Normalize metric labels for consistent comparison.
+        
+        Sorts labels by key and converts to JSON string to ensure consistent
+        matching when searching for existing metric_id entries.
+        
+        Args:
+            labels: Dictionary of metric labels
+            
+        Returns:
+            JSON string with sorted keys
+        """
+        # Sort by key to ensure consistent ordering
+        sorted_labels = dict(sorted(labels.items()))
+        return json.dumps(sorted_labels, sort_keys=True)
+
+    def _find_or_get_job_idx(
+        self, 
+        conn: Any, 
+        job_id: str
+    ) -> Optional[int]:
+        """Find existing job_idx for a given job_id, or create new one.
+        
+        Since job_idx is BIGSERIAL (auto-incrementing), we need to find
+        the job_idx value for a given job_id. If no entry exists, we create
+        a placeholder entry to generate a new job_idx.
+        
+        Args:
+            conn: Database connection
+            job_id: Job ID to look up
+            
+        Returns:
+            job_idx value if found or created, None on error
+        """
+        try:
+            # Try to find existing job_idx for this job_id
+            query = text("""
+                SELECT DISTINCT job_idx
+                FROM vm_metric_metadata
+                WHERE job_id = :job_id
+                LIMIT 1
+            """)
+            
+            result = conn.execute(query, {"job_id": job_id})
+            row = result.fetchone()
+            
+            if row:
+                job_idx = row[0]
+                self.logger.debug(
+                    "Found existing job_idx=%s for job_id='%s'",
+                    job_idx,
+                    job_id
+                )
+                return job_idx
+            
+            # No existing job_idx found - create placeholder entry
+            # This will generate a new job_idx via BIGSERIAL
+            # We use metric_id=0 as a placeholder that can be cleaned up later if needed
+            placeholder_query = text("""
+                INSERT INTO vm_metric_metadata (
+                    job_id, metric_name, metric_labels, metric_id
+                )
+                VALUES (
+                    :job_id, :metric_name, CAST(:metric_labels AS jsonb), 0
+                )
+                RETURNING job_idx
+            """)
+            
+            placeholder_labels = json.dumps({}, sort_keys=True)
+            insert_result = conn.execute(placeholder_query, {
+                "job_id": job_id,
+                "metric_name": "__placeholder__",
+                "metric_labels": placeholder_labels
+            })
+            
+            conn.commit()
+            new_job_idx = insert_result.fetchone()[0]
+            
+            self.logger.info(
+                "Created new job_idx=%s for job_id='%s'",
+                new_job_idx,
+                job_id
+            )
+            
+            return new_job_idx
+            
+        except SQLAlchemyError as exc:
+            self.logger.error(
+                "Database error finding/creating job_idx for job_id='%s': %s",
+                job_id,
+                exc
+            )
+            if conn:
+                conn.rollback()
+            return None
+        except Exception as exc:
+            self.logger.error(
+                "Failed to find/create job_idx for job_id='%s': %s",
+                job_id,
+                exc
+            )
+            return None
+
+    def _find_or_get_metric_id(
+        self,
+        conn: Any,
+        job_idx: int,
+        job_id: str,
+        metric_name: str,
+        metric_labels: Dict[str, str]
+    ) -> Optional[int]:
+        """Find existing metric_id or create new one in vm_metric_metadata.
+        
+        Searches for existing metric_id by matching job_idx, job_id, metric_name,
+        and normalized metric_labels. If not found, inserts a new row and returns
+        the new metric_id.
+        
+        Args:
+            conn: Database connection
+            job_idx: Job index value
+            job_id: Job ID string
+            metric_name: Metric name
+            metric_labels: Dictionary of metric labels (will be normalized)
+            
+        Returns:
+            metric_id value (existing or newly created), None on error
+        """
+        try:
+            # Normalize labels for comparison
+            normalized_labels_json = self._normalize_metric_labels_for_comparison(metric_labels)
+            
+            # First, try to find existing metric_id
+            # We need to compare normalized JSON strings
+            query = text("""
+                SELECT metric_id
+                FROM vm_metric_metadata
+                WHERE job_idx = :job_idx
+                  AND job_id = :job_id
+                  AND metric_name = :metric_name
+                  AND metric_labels::text = :normalized_labels_json
+                LIMIT 1
+            """)
+            
+            result = conn.execute(query, {
+                "job_idx": job_idx,
+                "job_id": job_id,
+                "metric_name": metric_name,
+                "normalized_labels_json": normalized_labels_json
+            })
+            row = result.fetchone()
+            
+            if row:
+                metric_id = row[0]
+                self.logger.debug(
+                    "Found existing metric_id=%s for job_id='%s', metric_name='%s'",
+                    metric_id,
+                    job_id,
+                    metric_name
+                )
+                return metric_id
+            
+            # Not found - need to create new entry
+            # We need to determine the next metric_id for this job_idx
+            # Get the max metric_id for this job_idx and increment
+            max_query = text("""
+                SELECT COALESCE(MAX(metric_id), 0)
+                FROM vm_metric_metadata
+                WHERE job_idx = :job_idx
+            """)
+            
+            max_result = conn.execute(max_query, {"job_idx": job_idx})
+            max_row = max_result.fetchone()
+            new_metric_id = (max_row[0] if max_row else 0) + 1
+            
+            # Insert new metadata entry
+            insert_query = text("""
+                INSERT INTO vm_metric_metadata (
+                    job_idx, metric_id, job_id, metric_name, metric_labels
+                )
+                VALUES (
+                    :job_idx, :metric_id, :job_id, :metric_name, CAST(:metric_labels AS jsonb)
+                )
+                RETURNING metric_id
+            """)
+            
+            insert_result = conn.execute(insert_query, {
+                "job_idx": job_idx,
+                "metric_id": new_metric_id,
+                "job_id": job_id,
+                "metric_name": metric_name,
+                "metric_labels": normalized_labels_json
+            })
+            
+            conn.commit()
+            new_metric_id = insert_result.fetchone()[0]
+            
+            self.logger.info(
+                "Created new metric_id=%s for job_id='%s', metric_name='%s'",
+                new_metric_id,
+                job_id,
+                metric_name
+            )
+            
+            return new_metric_id
+            
+        except SQLAlchemyError as exc:
+            self.logger.error(
+                "Database error finding/creating metric_id for job_id='%s', metric_name='%s': %s",
+                job_id,
+                metric_name,
+                exc
+            )
+            if conn:
+                conn.rollback()
+            return None
+        except Exception as exc:
+            self.logger.error(
+                "Failed to find/create metric_id for job_id='%s', metric_name='%s': %s",
+                job_id,
+                metric_name,
+                exc
+            )
+            return None
+
     def _write_forecasts_to_database(
         self,
         state: MetricsForecastState,
@@ -1465,13 +1150,20 @@ class MetricsForecastJob(BaseJob):
         forecast_df: pd.DataFrame,
         forecast_run_id: Optional[int] = None,
     ) -> int:
-        """Write forecast data to database using upsert logic.
+        """Write forecast data to new schema (vm_metric_data and vm_metric_metadata).
+        
+        This method:
+        1. Extracts job label and adds "_forecast" suffix
+        2. Removes job label from metric_labels
+        3. Adds forecast_type to metric_labels
+        4. Finds or creates job_idx and metric_id in vm_metric_metadata
+        5. Inserts forecast values into vm_metric_data
         
         Args:
             state: Job state with database connection
             series: Series history containing metric metadata
             forecast_df: Prophet forecast DataFrame with predictions
-            forecast_run_id: Optional reference to vm_forecast_job run record
+            forecast_run_id: Optional reference to vm_forecast_job run record (not used in new schema)
             
         Returns:
             Number of forecast rows written
@@ -1481,28 +1173,34 @@ class MetricsForecastJob(BaseJob):
             if not conn:
                 raise ValueError("Database connection not available")
             
-            # Extract job label (required for database partitioning)
-            job = series.labels.get("job")
-            if not job:
+            # Extract job label (required for transformation)
+            input_job = series.labels.get("job")
+            if not input_job:
                 self.logger.error(
                     "Missing 'job' label in series %s",
                     series.metric_name,
                 )
                 return 0
             
-            # Extract auid label (optional - use empty string if missing)
-            auid = series.labels.get("auid", "")
+            # Transform job_id: add "_forecast" suffix
+            forecast_job_id = f"{input_job}_forecast"
             
-            # Build remaining labels JSON (exclude job, auid, biz_date, forecast)
+            # Prepare metric_labels: remove job label and exclude system labels
             excluded_labels = {"job", "auid", "biz_date", "forecast"}
-            remaining_labels = {
+            base_metric_labels = {
                 k: v for k, v in series.labels.items() 
                 if k not in excluded_labels
             }
-            metric_labels_json = json.dumps(remaining_labels, sort_keys=True)
             
-            # Get current timestamp for all rows
-            current_timestamp = datetime.utcnow()
+            # Find or get job_idx for the forecast_job_id
+            job_idx = self._find_or_get_job_idx(conn, forecast_job_id)
+            
+            if job_idx is None:
+                self.logger.error(
+                    "Failed to get job_idx for forecast_job_id='%s'",
+                    forecast_job_id
+                )
+                return 0
             
             # Prepare rows for batch insert
             rows_to_insert = []
@@ -1510,6 +1208,10 @@ class MetricsForecastJob(BaseJob):
             for future_row in forecast_df.itertuples():
                 # Use forecast date as-is (biz_date from Prophet forecast)
                 forecast_date = future_row.ds.date()
+                forecast_timestamp = datetime.combine(
+                    forecast_date, 
+                    datetime.min.time()
+                ).replace(tzinfo=timezone.utc)
                 
                 for forecast_type in state.forecast_types:
                     name = forecast_type.get("name")
@@ -1521,45 +1223,50 @@ class MetricsForecastJob(BaseJob):
                     if value is None or np.isnan(value):
                         continue
                     
+                    # Add forecast_type to metric_labels for this forecast
+                    metric_labels_with_type = dict(base_metric_labels)
+                    metric_labels_with_type["forecast_type"] = name
+                    
+                    # Find or get metric_id for this combination
+                    metric_id = self._find_or_get_metric_id(
+                        conn,
+                        job_idx,
+                        forecast_job_id,
+                        series.metric_name,
+                        metric_labels_with_type
+                    )
+                    
+                    if metric_id is None:
+                        self.logger.warning(
+                            "Failed to get metric_id for %s (forecast_type=%s), skipping",
+                            series.metric_name,
+                            name
+                        )
+                        continue
+                    
                     rows_to_insert.append({
-                        "job": job,
-                        "biz_date": forecast_date,
-                        "auid": auid,
-                        "metric_name": series.metric_name,
-                        "value": float(value),
-                        "metric_labels": metric_labels_json,
-                        "forecast_type": name,
-                        "forecast_run_id": forecast_run_id,
-                        "created_at": current_timestamp,
-                        "updated_at": current_timestamp,
+                        "job_idx": job_idx,
+                        "metric_id": metric_id,
+                        "metric_timestamp": forecast_timestamp,
+                        "metric_value": float(value),
                     })
             
             if not rows_to_insert:
                 self.logger.debug("No forecast rows to write for %s", series.metric_name)
                 return 0
             
-            # Build PostgreSQL upsert statement
+            # Build PostgreSQL upsert statement for vm_metric_data
             # ON CONFLICT ... DO UPDATE for idempotent writes
-            
             upsert_sql = text("""
-                INSERT INTO vm_forecasted_metric (
-                    job, biz_date, auid, metric_name, 
-                    value, metric_labels, forecast_type,
-                    forecast_run_id,
-                    created_at, updated_at
+                INSERT INTO vm_metric_data (
+                    job_idx, metric_id, metric_timestamp, metric_value
                 )
                 VALUES (
-                    :job, :biz_date, :auid, :metric_name,
-                    :value, CAST(:metric_labels AS jsonb), :forecast_type,
-                    :forecast_run_id,
-                    :created_at, :updated_at
+                    :job_idx, :metric_id, :metric_timestamp, :metric_value
                 )
-                ON CONFLICT (job, biz_date, auid, metric_name, forecast_type)
+                ON CONFLICT (job_idx, metric_id, metric_timestamp)
                 DO UPDATE SET
-                    value = EXCLUDED.value,
-                    metric_labels = EXCLUDED.metric_labels,
-                    forecast_run_id = EXCLUDED.forecast_run_id,
-                    updated_at = EXCLUDED.updated_at
+                    metric_value = EXCLUDED.metric_value
             """)
             
             # Execute batch insert
@@ -1569,11 +1276,11 @@ class MetricsForecastJob(BaseJob):
             conn.commit()
             
             self.logger.info(
-                "Wrote %s forecast rows for %s (job=%s, auid=%s)",
+                "Wrote %s forecast rows for %s (job_idx=%s, forecast_job_id='%s')",
                 len(rows_to_insert),
                 series.metric_name,
-                job,
-                auid,
+                job_idx,
+                forecast_job_id,
             )
             
             return len(rows_to_insert)
