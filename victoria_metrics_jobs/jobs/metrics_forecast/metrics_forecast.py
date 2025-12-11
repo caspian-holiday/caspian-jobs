@@ -1148,7 +1148,7 @@ class MetricsForecastJob(BaseJob):
         state: MetricsForecastState,
         series: SeriesHistory,
         forecast_df: pd.DataFrame,
-        forecast_run_id: Optional[int] = None,
+        run_id: Optional[int] = None,
     ) -> int:
         """Write forecast data to new schema (vm_metric_data and vm_metric_metadata).
         
@@ -1163,7 +1163,7 @@ class MetricsForecastJob(BaseJob):
             state: Job state with database connection
             series: Series history containing metric metadata
             forecast_df: Prophet forecast DataFrame with predictions
-            forecast_run_id: Optional reference to vm_forecast_job run record (not used in new schema)
+            run_id: Optional reference to vm_forecast_job run record (stored in vm_metric_data)
             
         Returns:
             Number of forecast rows written
@@ -1282,6 +1282,7 @@ class MetricsForecastJob(BaseJob):
                         "metric_id": metric_id,
                         "metric_timestamp": forecast_timestamp,
                         "metric_value": float(value),
+                        "run_id": run_id,  # Store run_id to track which forecast run generated this data
                     })
             
             if not rows_to_insert:
@@ -1292,14 +1293,15 @@ class MetricsForecastJob(BaseJob):
             # ON CONFLICT ... DO UPDATE for idempotent writes
             upsert_sql = text("""
                 INSERT INTO public.vm_metric_data (
-                    job_idx, metric_id, metric_timestamp, metric_value
+                    job_idx, metric_id, metric_timestamp, metric_value, run_id
                 )
                 VALUES (
-                    :job_idx, :metric_id, :metric_timestamp, :metric_value
+                    :job_idx, :metric_id, :metric_timestamp, :metric_value, :run_id
                 )
                 ON CONFLICT (job_idx, metric_id, metric_timestamp)
                 DO UPDATE SET
-                    metric_value = EXCLUDED.metric_value
+                    metric_value = EXCLUDED.metric_value,
+                    run_id = EXCLUDED.run_id
             """)
             
             # Execute batch insert
