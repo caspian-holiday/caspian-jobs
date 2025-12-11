@@ -1051,14 +1051,15 @@ class MetricsForecastJob(BaseJob):
             normalized_labels_json = self._normalize_metric_labels_for_comparison(metric_labels)
             
             # First, try to find existing metric_id
-            # We need to compare normalized JSON strings
+            # Use JSONB equality operator (=) for exact matching
+            # Cast both sides to JSONB to ensure proper comparison regardless of formatting
             query = text("""
                 SELECT metric_id
                 FROM public.vm_metric_metadata
                 WHERE job_idx = :job_idx
                   AND job_id = :job_id
                   AND metric_name = :metric_name
-                  AND metric_labels::text = :normalized_labels_json
+                  AND metric_labels = CAST(:normalized_labels_json AS jsonb)
                 LIMIT 1
             """)
             
@@ -1072,13 +1073,23 @@ class MetricsForecastJob(BaseJob):
             
             if row:
                 metric_id = row[0]
-                self.logger.debug(
-                    "Found existing metric_id=%s for job_id='%s', metric_name='%s'",
+                self.logger.info(
+                    "Found existing metric_id=%s for job_id='%s', metric_name='%s', labels=%s",
                     metric_id,
                     job_id,
-                    metric_name
+                    metric_name,
+                    normalized_labels_json[:100] if len(normalized_labels_json) > 100 else normalized_labels_json
                 )
                 return metric_id
+            
+            # Log when we don't find existing entry for debugging
+            self.logger.debug(
+                "No existing metric_id found for job_idx=%s, job_id='%s', metric_name='%s', labels=%s",
+                job_idx,
+                job_id,
+                metric_name,
+                normalized_labels_json[:100] if len(normalized_labels_json) > 100 else normalized_labels_json
+            )
             
             # Not found - need to create new entry
             # We need to determine the next metric_id for this job_idx
