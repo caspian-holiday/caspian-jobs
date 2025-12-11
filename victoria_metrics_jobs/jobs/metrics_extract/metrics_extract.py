@@ -702,7 +702,10 @@ class MetricsExtractJob(BaseJob):
         return json.dumps(sorted_labels, sort_keys=True)
 
     def _find_or_get_job_idx(self, conn: Any, job_id: str) -> Optional[int]:
-        """Find existing job_idx for a given job_id, or create new one."""
+        """Find existing job_idx for a given job_id.
+        
+        Returns None if no job_idx exists - the first metric entry will create it automatically.
+        """
         try:
             # Try to find existing job_idx for this job_id
             query = text("""
@@ -722,142 +725,167 @@ class MetricsExtractJob(BaseJob):
                 )
                 return job_idx
 
-            # No existing job_idx found - create placeholder entry
-            placeholder_query = text("""
-                INSERT INTO public.vm_metric_metadata (
-                    job_id, metric_name, metric_labels, metric_id
-                )
-                VALUES (
-                    :job_id, :metric_name, CAST(:metric_labels AS jsonb), 0
-                )
-                RETURNING job_idx
-            """)
-
-            placeholder_labels = json.dumps({}, sort_keys=True)
-            insert_result = conn.execute(
-                placeholder_query,
-                {
-                    "job_id": job_id,
-                    "metric_name": "__placeholder__",
-                    "metric_labels": placeholder_labels,
-                },
+            # No existing job_idx found - return None
+            # The first metric entry will auto-generate the job_idx via BIGSERIAL
+            self.logger.debug(
+                "No existing job_idx for job_id='%s' - will be created with first metric entry",
+                job_id,
             )
-
-            conn.commit()
-            new_job_idx = insert_result.fetchone()[0]
-
-            self.logger.info(
-                "Created new job_idx=%s for job_id='%s'", new_job_idx, job_id
-            )
-
-            return new_job_idx
+            return None
 
         except SQLAlchemyError as exc:
             self.logger.error(
-                "Database error finding/creating job_idx for job_id='%s': %s",
+                "Database error finding job_idx for job_id='%s': %s",
                 job_id,
                 exc,
             )
-            if conn:
-                conn.rollback()
             return None
         except Exception as exc:
             self.logger.error(
-                "Failed to find/create job_idx for job_id='%s': %s", job_id, exc
+                "Failed to find job_idx for job_id='%s': %s", job_id, exc
             )
             return None
 
     def _find_or_get_metric_id(
         self,
         conn: Any,
-        job_idx: int,
+        job_idx: Optional[int],
         job_id: str,
         metric_name: str,
         metric_labels: Dict[str, str],
-    ) -> Optional[int]:
-        """Find existing metric_id or create new one in vm_metric_metadata."""
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """Find existing metric_id or create new one in vm_metric_metadata.
+        
+        Args:
+            conn: Database connection
+            job_idx: Existing job_idx, or None if this is the first metric for this job_id
+            job_id: Job ID string
+            metric_name: Metric name
+            metric_labels: Dictionary of metric labels (will be normalized)
+            
+        Returns:
+            Tuple of (job_idx, metric_id) - both will be set after first insert if job_idx was None
+        """
         try:
             # Normalize labels for comparison
             normalized_labels_json = self._normalize_metric_labels_for_comparison(
                 metric_labels
             )
 
-            # First, try to find existing metric_id
-            query = text("""
-                SELECT metric_id
-                FROM public.vm_metric_metadata
-                WHERE job_idx = :job_idx
-                  AND job_id = :job_id
-                  AND metric_name = :metric_name
-                  AND metric_labels = CAST(:normalized_labels_json AS jsonb)
-                LIMIT 1
-            """)
+            # If job_idx is provided, try to find existing metric_id
+            if job_idx is not None:
+                query = text("""
+                    SELECT metric_id
+                    FROM public.vm_metric_metadata
+                    WHERE job_idx = :job_idx
+                      AND job_id = :job_id
+                      AND metric_name = :metric_name
+                      AND metric_labels = CAST(:normalized_labels_json AS jsonb)
+                    LIMIT 1
+                """)
 
-            result = conn.execute(
-                query,
-                {
-                    "job_idx": job_idx,
-                    "job_id": job_id,
-                    "metric_name": metric_name,
-                    "normalized_labels_json": normalized_labels_json,
-                },
-            )
-            row = result.fetchone()
+                result = conn.execute(
+                    query,
+                    {
+                        "job_idx": job_idx,
+                        "job_id": job_id,
+                        "metric_name": metric_name,
+                        "normalized_labels_json": normalized_labels_json,
+                    },
+                )
+                row = result.fetchone()
 
-            if row:
-                metric_id = row[0]
-                self.logger.debug(
-                    "Found existing metric_id=%s for job_id='%s', metric_name='%s'",
-                    metric_id,
+                if row:
+                    metric_id = row[0]
+                    self.logger.debug(
+                        "Found existing metric_id=%s for job_id='%s', metric_name='%s'",
+                        metric_id,
+                        job_id,
+                        metric_name,
+                    )
+                    return (job_idx, metric_id)
+
+                # Not found - need to create new entry with existing job_idx
+                max_query = text("""
+                    SELECT COALESCE(MAX(metric_id), 0)
+                    FROM public.vm_metric_metadata
+                    WHERE job_idx = :job_idx
+                """)
+
+                max_result = conn.execute(max_query, {"job_idx": job_idx})
+                max_row = max_result.fetchone()
+                new_metric_id = (max_row[0] if max_row else 0) + 1
+
+                # Insert new metadata entry
+                insert_query = text("""
+                    INSERT INTO public.vm_metric_metadata (
+                        job_idx, metric_id, job_id, metric_name, metric_labels
+                    )
+                    VALUES (
+                        :job_idx, :metric_id, :job_id, :metric_name, CAST(:metric_labels AS jsonb)
+                    )
+                    RETURNING metric_id
+                """)
+
+                insert_result = conn.execute(
+                    insert_query,
+                    {
+                        "job_idx": job_idx,
+                        "metric_id": new_metric_id,
+                        "job_id": job_id,
+                        "metric_name": metric_name,
+                        "metric_labels": normalized_labels_json,
+                    },
+                )
+
+                conn.commit()
+                new_metric_id = insert_result.fetchone()[0]
+
+                self.logger.info(
+                    "Created new metric_id=%s for job_id='%s', metric_name='%s'",
+                    new_metric_id,
                     job_id,
                     metric_name,
                 )
-                return metric_id
 
-            # Not found - need to create new entry
-            max_query = text("""
-                SELECT COALESCE(MAX(metric_id), 0)
-                FROM public.vm_metric_metadata
-                WHERE job_idx = :job_idx
-            """)
+                return (job_idx, new_metric_id)
+            else:
+                # No job_idx exists - this is the first metric for this job_id
+                # Insert will auto-generate job_idx via BIGSERIAL
+                # Use metric_id = 1 for the first metric
+                insert_query = text("""
+                    INSERT INTO public.vm_metric_metadata (
+                        job_idx, metric_id, job_id, metric_name, metric_labels
+                    )
+                    VALUES (
+                        DEFAULT, 1, :job_id, :metric_name, CAST(:metric_labels AS jsonb)
+                    )
+                    RETURNING job_idx, metric_id
+                """)
 
-            max_result = conn.execute(max_query, {"job_idx": job_idx})
-            max_row = max_result.fetchone()
-            new_metric_id = (max_row[0] if max_row else 0) + 1
-
-            # Insert new metadata entry
-            insert_query = text("""
-                INSERT INTO public.vm_metric_metadata (
-                    job_idx, metric_id, job_id, metric_name, metric_labels
+                insert_result = conn.execute(
+                    insert_query,
+                    {
+                        "job_id": job_id,
+                        "metric_name": metric_name,
+                        "metric_labels": normalized_labels_json,
+                    },
                 )
-                VALUES (
-                    :job_idx, :metric_id, :job_id, :metric_name, CAST(:metric_labels AS jsonb)
+
+                conn.commit()
+                row = insert_result.fetchone()
+                new_job_idx = row[0]
+                new_metric_id = row[1]
+
+                self.logger.info(
+                    "Created new job_idx=%s and metric_id=%s for job_id='%s', metric_name='%s'",
+                    new_job_idx,
+                    new_metric_id,
+                    job_id,
+                    metric_name,
                 )
-                RETURNING metric_id
-            """)
 
-            insert_result = conn.execute(
-                insert_query,
-                {
-                    "job_idx": job_idx,
-                    "metric_id": new_metric_id,
-                    "job_id": job_id,
-                    "metric_name": metric_name,
-                    "metric_labels": normalized_labels_json,
-                },
-            )
-
-            conn.commit()
-            new_metric_id = insert_result.fetchone()[0]
-
-            self.logger.info(
-                "Created new metric_id=%s for job_id='%s', metric_name='%s'",
-                new_metric_id,
-                job_id,
-                metric_name,
-            )
-
-            return new_metric_id
+                return (new_job_idx, new_metric_id)
 
         except SQLAlchemyError as exc:
             self.logger.error(
@@ -868,7 +896,7 @@ class MetricsExtractJob(BaseJob):
             )
             if conn:
                 conn.rollback()
-            return None
+            return (None, None)
         except Exception as exc:
             self.logger.error(
                 "Failed to find/create metric_id for job_id='%s', metric_name='%s': %s",
@@ -876,7 +904,7 @@ class MetricsExtractJob(BaseJob):
                 metric_name,
                 exc,
             )
-            return None
+            return (None, None)
 
     def _save_series_to_database(
         self,
@@ -911,21 +939,18 @@ class MetricsExtractJob(BaseJob):
                 k: v for k, v in series.labels.items() if k not in excluded_labels
             }
 
-            # Find or get job_idx for the job_id
+            # Find existing job_idx for the job_id (may be None if first metric)
             job_idx = self._find_or_get_job_idx(conn, job_id)
 
-            if job_idx is None:
-                self.logger.error("Failed to get job_idx for job_id='%s'", job_id)
-                return (0, None)
-
             # Find or get metric_id for this series
-            metric_id = self._find_or_get_metric_id(
+            # This will create job_idx automatically if it doesn't exist
+            job_idx, metric_id = self._find_or_get_metric_id(
                 conn, job_idx, job_id, series.metric_name, metric_labels
             )
 
-            if metric_id is None:
+            if job_idx is None or metric_id is None:
                 self.logger.warning(
-                    "Failed to get metric_id for %s, skipping", series.metric_name
+                    "Failed to get job_idx/metric_id for %s, skipping", series.metric_name
                 )
                 return (0, None)
 
