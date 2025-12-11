@@ -1203,7 +1203,8 @@ class MetricsForecastJob(BaseJob):
                 return 0
             
             # Each forecast_type becomes its own timeseries with its own metric_id
-            # Look up or create metadata for each forecast_type first (outside the date loop for efficiency)
+            # STEP 1: Look up or create ALL metadata entries FIRST (before inserting any data)
+            # This ensures the FK constraint is satisfied
             forecast_type_metric_ids = {}
             
             for forecast_type in state.forecast_types:
@@ -1216,7 +1217,7 @@ class MetricsForecastJob(BaseJob):
                 metric_labels_with_type["forecast_type"] = name
                 
                 # Find or get metric_id for this forecast_type timeseries
-                # This creates separate metadata entries for trend/lower/upper
+                # This will CREATE the metadata entry if it doesn't exist
                 metric_id = self._find_or_get_metric_id(
                     conn,
                     job_idx,
@@ -1241,6 +1242,12 @@ class MetricsForecastJob(BaseJob):
                     series.metric_name
                 )
                 return 0
+            
+            # STEP 2: Ensure all metadata entries are committed before inserting data
+            # (The _find_or_get_metric_id method commits after creation, but we ensure it's done here)
+            conn.commit()
+            
+            # STEP 3: Now we can safely insert data (FK constraint will be satisfied)
             
             # Now prepare rows for batch insert using the pre-looked-up metric_ids
             rows_to_insert = []
