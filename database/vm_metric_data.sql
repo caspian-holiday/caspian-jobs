@@ -12,11 +12,12 @@
 -- Purpose: Stores time-series metric values
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS vm_metric_data (
-    job_idx BIGINT NOT NULL REFERENCES vm_metric_metadata(job_idx, metric_id),
-    metric_id INT NOT NULL REFERENCES vm_metric_metadata(job_idx, metric_id),
+    job_idx BIGINT NOT NULL,
+    metric_id INT NOT NULL,
     metric_timestamp TIMESTAMPTZ NOT NULL,
     metric_value DOUBLE PRECISION NOT NULL,
-    PRIMARY KEY (job_idx, metric_id, metric_timestamp)
+    PRIMARY KEY (job_idx, metric_id, metric_timestamp),
+    FOREIGN KEY (job_idx, metric_id) REFERENCES vm_metric_metadata(job_idx, metric_id)
 );
 
 -- Indexes for efficient time-series queries

@@ -1185,7 +1185,7 @@ class MetricsForecastJob(BaseJob):
             # Transform job_id: add "_forecast" suffix
             forecast_job_id = f"{input_job}_forecast"
             
-            # Prepare metric_labels: remove job label and exclude system labels
+            # Prepare base metric_labels: remove job label and exclude system labels
             excluded_labels = {"job", "auid", "biz_date", "forecast"}
             base_metric_labels = {
                 k: v for k, v in series.labels.items() 
@@ -1202,7 +1202,47 @@ class MetricsForecastJob(BaseJob):
                 )
                 return 0
             
-            # Prepare rows for batch insert
+            # Each forecast_type becomes its own timeseries with its own metric_id
+            # Look up or create metadata for each forecast_type first (outside the date loop for efficiency)
+            forecast_type_metric_ids = {}
+            
+            for forecast_type in state.forecast_types:
+                name = forecast_type.get("name")
+                if not name:
+                    continue
+                
+                # Add forecast_type to metric_labels - this makes each forecast_type a separate timeseries
+                metric_labels_with_type = dict(base_metric_labels)
+                metric_labels_with_type["forecast_type"] = name
+                
+                # Find or get metric_id for this forecast_type timeseries
+                # This creates separate metadata entries for trend/lower/upper
+                metric_id = self._find_or_get_metric_id(
+                    conn,
+                    job_idx,
+                    forecast_job_id,
+                    series.metric_name,
+                    metric_labels_with_type
+                )
+                
+                if metric_id is None:
+                    self.logger.warning(
+                        "Failed to get metric_id for %s (forecast_type=%s), skipping this forecast type",
+                        series.metric_name,
+                        name
+                    )
+                    continue
+                
+                forecast_type_metric_ids[name] = metric_id
+            
+            if not forecast_type_metric_ids:
+                self.logger.warning(
+                    "No valid metric_ids found for any forecast_type for %s, skipping",
+                    series.metric_name
+                )
+                return 0
+            
+            # Now prepare rows for batch insert using the pre-looked-up metric_ids
             rows_to_insert = []
             
             for future_row in forecast_df.itertuples():
@@ -1219,30 +1259,16 @@ class MetricsForecastJob(BaseJob):
                     if not name or not field or not hasattr(future_row, field):
                         continue
                     
+                    # Skip if we didn't get a metric_id for this forecast_type
+                    if name not in forecast_type_metric_ids:
+                        continue
+                    
                     value = getattr(future_row, field)
                     if value is None or np.isnan(value):
                         continue
                     
-                    # Add forecast_type to metric_labels for this forecast
-                    metric_labels_with_type = dict(base_metric_labels)
-                    metric_labels_with_type["forecast_type"] = name
-                    
-                    # Find or get metric_id for this combination
-                    metric_id = self._find_or_get_metric_id(
-                        conn,
-                        job_idx,
-                        forecast_job_id,
-                        series.metric_name,
-                        metric_labels_with_type
-                    )
-                    
-                    if metric_id is None:
-                        self.logger.warning(
-                            "Failed to get metric_id for %s (forecast_type=%s), skipping",
-                            series.metric_name,
-                            name
-                        )
-                        continue
+                    # Use the pre-looked-up metric_id for this forecast_type
+                    metric_id = forecast_type_metric_ids[name]
                     
                     rows_to_insert.append({
                         "job_idx": job_idx,
