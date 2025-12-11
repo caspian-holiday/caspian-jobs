@@ -262,7 +262,7 @@ class MetricsForecastJob(BaseJob):
                     min_history_points,
                     cutoff_hour,
                     notes
-                FROM vm_forecast_config
+                FROM public.vm_forecast_config
                 WHERE job_id = :job_id
                   AND enabled = true
                 ORDER BY config_id
@@ -746,7 +746,7 @@ class MetricsForecastJob(BaseJob):
                 return None
             
             insert_sql = text("""
-                INSERT INTO vm_forecast_job (
+                INSERT INTO public.vm_forecast_job (
                     job_id,
                     selection_value,
                     prophet_config,
@@ -957,7 +957,7 @@ class MetricsForecastJob(BaseJob):
             # Try to find existing job_idx for this job_id
             query = text("""
                 SELECT DISTINCT job_idx
-                FROM vm_metric_metadata
+                FROM public.vm_metric_metadata
                 WHERE job_id = :job_id
                 LIMIT 1
             """)
@@ -978,7 +978,7 @@ class MetricsForecastJob(BaseJob):
             # This will generate a new job_idx via BIGSERIAL
             # We use metric_id=0 as a placeholder that can be cleaned up later if needed
             placeholder_query = text("""
-                INSERT INTO vm_metric_metadata (
+                INSERT INTO public.vm_metric_metadata (
                     job_id, metric_name, metric_labels, metric_id
                 )
                 VALUES (
@@ -1054,7 +1054,7 @@ class MetricsForecastJob(BaseJob):
             # We need to compare normalized JSON strings
             query = text("""
                 SELECT metric_id
-                FROM vm_metric_metadata
+                FROM public.vm_metric_metadata
                 WHERE job_idx = :job_idx
                   AND job_id = :job_id
                   AND metric_name = :metric_name
@@ -1085,7 +1085,7 @@ class MetricsForecastJob(BaseJob):
             # Get the max metric_id for this job_idx and increment
             max_query = text("""
                 SELECT COALESCE(MAX(metric_id), 0)
-                FROM vm_metric_metadata
+                FROM public.vm_metric_metadata
                 WHERE job_idx = :job_idx
             """)
             
@@ -1095,7 +1095,7 @@ class MetricsForecastJob(BaseJob):
             
             # Insert new metadata entry
             insert_query = text("""
-                INSERT INTO vm_metric_metadata (
+                INSERT INTO public.vm_metric_metadata (
                     job_idx, metric_id, job_id, metric_name, metric_labels
                 )
                 VALUES (
@@ -1291,7 +1291,7 @@ class MetricsForecastJob(BaseJob):
             # Build PostgreSQL upsert statement for vm_metric_data
             # ON CONFLICT ... DO UPDATE for idempotent writes
             upsert_sql = text("""
-                INSERT INTO vm_metric_data (
+                INSERT INTO public.vm_metric_data (
                     job_idx, metric_id, metric_timestamp, metric_value
                 )
                 VALUES (
