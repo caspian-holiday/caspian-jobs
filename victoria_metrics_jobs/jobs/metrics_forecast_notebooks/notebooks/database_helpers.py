@@ -7,6 +7,9 @@ without duplicating code.
 """
 
 import json
+import os
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
@@ -16,6 +19,105 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
+
+# Add the scheduler module to the path for imports
+# This allows notebooks to use ConfigLoader
+_helper_dir = Path(__file__).parent
+_project_root = _helper_dir.parent.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+from victoria_metrics_jobs.scheduler.config import ConfigLoader
+
+
+def load_database_config_from_yaml(
+    config_path: Optional[str] = None,
+    environment: Optional[str] = None
+) -> Dict[str, Any]:
+    """Load database configuration from YAML config file using VM_JOBS_ENVIRONMENT.
+    
+    This function:
+    1. Loads the environment-specific configuration from the YAML file
+    2. Extracts the database section
+    3. Overrides the password with VM_JOBS_DB_PASSWORD environment variable
+    
+    Args:
+        config_path: Path to the YAML configuration file. If None, tries to find it:
+            - Checks VM_JOBS_CONFIG_PATH environment variable
+            - Tries relative path from helper location: ../../../../victoria_metrics_jobs.yml
+            - Tries current working directory: victoria_metrics_jobs/victoria_metrics_jobs.yml
+        environment: Environment name ('local', 'dev', 'stg', 'prod'). If None, uses VM_JOBS_ENVIRONMENT env var.
+    
+    Returns:
+        Dictionary with database configuration keys: host, port, name, user, password, ssl_mode
+        
+    Raises:
+        ValueError: If environment is not set or config file not found
+        FileNotFoundError: If config file cannot be found
+    """
+    # Get environment from parameter or environment variable
+    if environment is None:
+        environment = os.getenv('VM_JOBS_ENVIRONMENT')
+    
+    if not environment:
+        raise ValueError(
+            "Environment must be specified. Provide 'environment' parameter or set "
+            "VM_JOBS_ENVIRONMENT environment variable to 'local', 'dev', 'stg', or 'prod'"
+        )
+    
+    # Determine config file path
+    if config_path is None:
+        # Try environment variable first
+        config_path = os.getenv('VM_JOBS_CONFIG_PATH')
+        
+        if config_path is None:
+            # Try relative to helper file location
+            candidate = _helper_dir / '../../../../victoria_metrics_jobs.yml'
+            if candidate.resolve().exists():
+                config_path = str(candidate.resolve())
+            else:
+                # Try current working directory
+                candidate = Path('victoria_metrics_jobs/victoria_metrics_jobs.yml')
+                if candidate.exists():
+                    config_path = str(candidate.resolve())
+                else:
+                    raise FileNotFoundError(
+                        "Could not find victoria_metrics_jobs.yml config file. "
+                        "Set VM_JOBS_CONFIG_PATH environment variable or ensure the config file "
+                        "is in the expected location."
+                    )
+    
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+    
+    # Load configuration using ConfigLoader
+    config_loader = ConfigLoader()
+    env_config = config_loader.load(config_path, environment=environment)
+    
+    # Extract database configuration
+    database_config = env_config.get('database', {})
+    if not database_config:
+        raise ValueError(
+            f"No 'database' section found in environment '{environment}' configuration"
+        )
+    
+    # Override password with VM_JOBS_DB_PASSWORD environment variable
+    password = os.getenv('VM_JOBS_DB_PASSWORD')
+    if not password:
+        raise ValueError(
+            "VM_JOBS_DB_PASSWORD environment variable must be set"
+        )
+    
+    # Build database config dict
+    db_config = {
+        'host': database_config.get('host', 'localhost'),
+        'port': int(database_config.get('port', 5432)),
+        'name': database_config.get('name', 'scheduler_local'),
+        'user': database_config.get('user', 'scheduler'),
+        'password': password,  # Always use env var, override YAML value
+        'ssl_mode': database_config.get('ssl_mode', 'prefer'),
+    }
+    
+    return db_config
 
 
 def build_database_connection_string(
@@ -67,23 +169,46 @@ def create_database_connection(
     user: Optional[str] = None,
     password: Optional[str] = None,
     ssl_mode: Optional[str] = None,
+    config_path: Optional[str] = None,
+    environment: Optional[str] = None,
 ) -> Tuple[Engine, Any]:
     """Create database connection and engine.
     
+    If connection parameters are not provided, loads them from the YAML config file
+    using VM_JOBS_ENVIRONMENT (from parameter or env var) and VM_JOBS_DB_PASSWORD environment variable.
+    
     Args:
-        connection_string: Full connection string (if provided, used as-is)
+        connection_string: Full connection string (if provided, used as-is, ignores other params)
         host: Database host (used if connection_string not provided)
         port: Database port (used if connection_string not provided)
         dbname: Database name (used if connection_string not provided)
         user: Database user (used if connection_string not provided)
         password: Database password (used if connection_string not provided)
         ssl_mode: SSL mode (used if connection_string not provided)
+        config_path: Path to YAML config file (used if connection_string and individual params not provided)
+        environment: Environment name ('local', 'dev', 'stg', 'prod'). If None, uses VM_JOBS_ENVIRONMENT env var.
         
     Returns:
         Tuple of (engine, connection)
     """
+    # If connection_string provided, use it directly
+    if connection_string:
+        engine = create_engine(connection_string)
+        conn = engine.connect()
+        return engine, conn
+    
+    # If individual params not provided, load from config
+    if not all([host, port, dbname, user, password]):
+        db_config = load_database_config_from_yaml(config_path=config_path, environment=environment)
+        host = host or db_config['host']
+        port = port or db_config['port']
+        dbname = dbname or db_config['name']
+        user = user or db_config['user']
+        password = password or db_config['password']
+        ssl_mode = ssl_mode or db_config['ssl_mode']
+    
     conn_str = build_database_connection_string(
-        connection_string=connection_string,
+        connection_string=None,
         host=host,
         port=port,
         dbname=dbname,

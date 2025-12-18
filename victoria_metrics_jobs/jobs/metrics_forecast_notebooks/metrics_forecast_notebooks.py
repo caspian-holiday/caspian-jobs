@@ -13,6 +13,7 @@ The job:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import subprocess
 from dataclasses import dataclass, field
@@ -326,11 +327,14 @@ class MetricsForecastNotebooksJob(BaseJob):
 
             start_time = time.time()
 
+            # Get environment from job config or environment variable
+            environment = os.getenv('VM_JOBS_ENVIRONMENT', '')
+            
             # Prepare parameters to inject into notebook
             notebook_parameters = {
                 "vm_query_url": state.vm_query_url,
                 "vm_token": state.vm_token,
-                "db_connection_string": state.db_connection_string,
+                "vm_jobs_environment": environment,
             }
 
             # Execute notebook with parameters
