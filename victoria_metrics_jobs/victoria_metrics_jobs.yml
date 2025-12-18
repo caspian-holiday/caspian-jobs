@@ -27,6 +27,15 @@ environments:
       retry_attempts: ${oc.env:VM_JOBS_VM_RETRY_ATTEMPTS,3}
       retry_delay: ${oc.env:VM_JOBS_VM_RETRY_DELAY,1}
     
+    # Prometheus metrics server settings
+    metrics:
+      directory: ${oc.env:VM_JOBS_METRICS_DIRECTORY,/var/lib/scheduler/metrics}
+      archive_directory: ${oc.env:VM_JOBS_METRICS_ARCHIVE_DIRECTORY,/var/lib/scheduler/metrics_archive}
+      enable_archive: ${oc.env:VM_JOBS_METRICS_ENABLE_ARCHIVE,true}
+      port: ${oc.env:VM_JOBS_METRICS_PORT,8000}
+      host: ${oc.env:VM_JOBS_METRICS_HOST,0.0.0.0}
+      retention_days: ${oc.env:VM_JOBS_METRICS_RETENTION_DAYS,14}
+    
     # Common configuration for job types
     common:
       extractor:
@@ -37,6 +46,28 @@ environments:
     
     # Consolidated job definitions
     jobs:
+      metrics_cleanup:
+        # Scheduler attributes (read by scheduler config loader)
+        id: metrics_cleanup
+        name: Metrics File Cleanup
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.metrics_cleanup", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_cleanup"]
+        schedule:
+          type: cron
+          args:
+            hour: 2
+            minute: 0
+        
+        # Job-specific attributes (read by job config loader)
+        job_type: metrics_cleanup
+        # Metrics configuration is automatically added from environment.metrics section
+        # Job-specific overrides (optional, for backward compatibility):
+        # metrics_directory: ${environments.local.metrics.directory}
+        # archive_directory: ${environments.local.metrics.archive_directory}
+        # enable_archive: ${environments.local.metrics.enable_archive}
+        # max_age_days: ${environments.local.metrics.retention_days}
+      
       system_a_extractor:
         # Scheduler attributes (read by scheduler config loader)
         id: system_a_extractor
@@ -255,6 +286,15 @@ environments:
       retry_attempts: ${oc.env:VM_JOBS_VM_RETRY_ATTEMPTS,3}
       retry_delay: ${oc.env:VM_JOBS_VM_RETRY_DELAY,1}
     
+    # Prometheus metrics server settings
+    metrics:
+      directory: ${oc.env:VM_JOBS_METRICS_DIRECTORY,/var/lib/scheduler/metrics}
+      archive_directory: ${oc.env:VM_JOBS_METRICS_ARCHIVE_DIRECTORY,/var/lib/scheduler/metrics_archive}
+      enable_archive: ${oc.env:VM_JOBS_METRICS_ENABLE_ARCHIVE,true}
+      port: ${oc.env:VM_JOBS_METRICS_PORT,8000}
+      host: ${oc.env:VM_JOBS_METRICS_HOST,0.0.0.0}
+      retention_days: ${oc.env:VM_JOBS_METRICS_RETENTION_DAYS,14}
+    
     # Common configuration for job types
     common:
       extractor:
@@ -265,6 +305,28 @@ environments:
     
     # Consolidated job definitions
     jobs:
+      metrics_cleanup:
+        # Scheduler attributes (read by scheduler config loader)
+        id: metrics_cleanup
+        name: Metrics File Cleanup
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.metrics_cleanup", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_cleanup"]
+        schedule:
+          type: cron
+          args:
+            hour: 2
+            minute: 0
+        
+        # Job-specific attributes (read by job config loader)
+        job_type: metrics_cleanup
+        # Metrics configuration is automatically added from environment.metrics section
+        # Job-specific overrides (optional, for backward compatibility):
+        # metrics_directory: ${environments.dev.metrics.directory}
+        # archive_directory: ${environments.dev.metrics.archive_directory}
+        # enable_archive: ${environments.dev.metrics.enable_archive}
+        # max_age_days: ${environments.dev.metrics.retention_days}
+      
       system_a_extractor:
         # Scheduler attributes (read by scheduler config loader)
         id: system_a_extractor

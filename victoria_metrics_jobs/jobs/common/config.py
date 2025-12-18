@@ -116,6 +116,10 @@ class JobConfigManager:
         if 'victoria_metrics' in env_config:
             result['victoria_metrics'] = env_config['victoria_metrics']
         
+        # Add metrics configuration to job config (for cleanup job and other metrics-aware jobs)
+        if 'metrics' in env_config:
+            result['metrics'] = env_config['metrics']
+        
         self.logger.info(f"Loaded configuration for job '{job_id}': {result['job_name']}")
         return result
     

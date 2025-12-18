@@ -92,6 +92,20 @@ class ConfigLoader(BaseConfigLoader):
         if not isinstance(config, dict):
             raise ValueError("Configuration must be a dictionary")
         
+        # Validate metrics section (optional)
+        if 'metrics' in config:
+            self._validate_metrics(config['metrics'])
+        else:
+            # Set default metrics configuration if not provided
+            config['metrics'] = {
+                'directory': '/var/lib/scheduler/metrics',
+                'archive_directory': '/var/lib/scheduler/metrics_archive',
+                'enable_archive': True,
+                'port': 8000,
+                'host': '0.0.0.0',
+                'retention_days': 14
+            }
+        
         # Validate jobs section
         if 'jobs' in config:
             # Support both dict and list formats
@@ -175,4 +189,70 @@ class ConfigLoader(BaseConfigLoader):
         
         if not isinstance(schedule['args'], dict):
             raise ValueError(f"Job {job_index} schedule args must be a dictionary")
+    
+    def _validate_metrics(self, metrics: Dict[str, Any]):
+        """Validate metrics configuration section.
+        
+        Args:
+            metrics: Metrics configuration dictionary
+            
+        Raises:
+            ValueError: If the metrics configuration is invalid
+        """
+        if not isinstance(metrics, dict):
+            raise ValueError("Metrics configuration must be a dictionary")
+        
+        # Validate directory
+        if 'directory' in metrics:
+            directory = metrics['directory']
+            if not isinstance(directory, str) or not directory.strip():
+                raise ValueError("Metrics directory must be a non-empty string")
+        else:
+            # Set default directory
+            metrics['directory'] = '/var/lib/scheduler/metrics'
+        
+        # Validate archive_directory (optional)
+        if 'archive_directory' in metrics:
+            archive_dir = metrics['archive_directory']
+            if archive_dir is not None and (not isinstance(archive_dir, str) or not archive_dir.strip()):
+                raise ValueError("Metrics archive_directory must be a non-empty string or None")
+        else:
+            # Set default archive directory
+            metrics['archive_directory'] = '/var/lib/scheduler/metrics_archive'
+        
+        # Validate enable_archive
+        if 'enable_archive' in metrics:
+            enable_archive = metrics['enable_archive']
+            if not isinstance(enable_archive, bool):
+                raise ValueError("Metrics enable_archive must be a boolean")
+        else:
+            # Set default
+            metrics['enable_archive'] = True
+        
+        # Validate port
+        if 'port' in metrics:
+            port = metrics['port']
+            if not isinstance(port, int) or port < 1 or port > 65535:
+                raise ValueError("Metrics port must be an integer between 1 and 65535")
+        else:
+            # Set default port
+            metrics['port'] = 8000
+        
+        # Validate host
+        if 'host' in metrics:
+            host = metrics['host']
+            if not isinstance(host, str) or not host.strip():
+                raise ValueError("Metrics host must be a non-empty string")
+        else:
+            # Set default host
+            metrics['host'] = '0.0.0.0'
+        
+        # Validate retention_days (optional)
+        if 'retention_days' in metrics:
+            retention = metrics['retention_days']
+            if not isinstance(retention, int) or retention < 1:
+                raise ValueError("Metrics retention_days must be a positive integer")
+        else:
+            # Set default
+            metrics['retention_days'] = 14
     
