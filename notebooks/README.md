@@ -1,3 +1,49 @@
+# Notebooks Directory
+
+This directory contains Jupyter notebooks for forecasting and parameter tuning.
+
+## Notebook Types
+
+### 1. Executable Forecast Notebooks
+
+These notebooks are executed by the `metrics_forecast_notebooks` job. Example notebooks are located in:
+- `victoria_metrics_jobs/jobs/metrics_forecast_notebooks/notebooks/prophet_forecast.ipynb` - Example Prophet forecast notebook
+- `victoria_metrics_jobs/jobs/metrics_forecast_notebooks/notebooks/arima_forecast.ipynb` - Example ARIMA forecast notebook
+
+**Creating Executable Notebooks:**
+
+1. Create a new `.ipynb` file in `victoria_metrics_jobs/jobs/metrics_forecast_notebooks/notebooks/` directory
+2. Hardcode your selector and model parameters in the configuration cell
+3. Use darts wrappers from the same directory: `darts_prophet_wrapper.py` or `darts_arima_wrapper.py` (both are in the job's notebooks directory)
+4. Include database saving logic (see example notebooks)
+5. The job will automatically discover and execute your notebook from the job's notebooks directory
+
+**Key Requirements:**
+- Notebook must be executable standalone (no user interaction)
+- Use hardcoded configuration (selector, model params, etc.)
+- Must save results to database (vm_metric_data and vm_metric_metadata tables)
+- Should handle errors gracefully
+
+See example notebooks for complete implementation patterns.
+
+### 2. Interactive Tuning Notebooks
+
+- `prophet_parameter_tuning.ipynb` - Interactive tool for exploring and tuning Prophet parameters
+
+## Darts Wrappers
+
+Helper modules for using forecasting models via darts. These are located in the job's notebooks directory:
+- `victoria_metrics_jobs/jobs/metrics_forecast_notebooks/notebooks/darts_prophet_wrapper.py` - Prophet model wrapper
+- `victoria_metrics_jobs/jobs/metrics_forecast_notebooks/notebooks/darts_arima_wrapper.py` - ARIMA model wrapper
+
+These wrappers provide:
+- DataFrame to TimeSeries conversion
+- Business day data preparation
+- Model training and forecasting
+- Forecast format conversion for database saving
+
+---
+
 # Prophet Parameter Tuning Notebook
 
 ## Overview

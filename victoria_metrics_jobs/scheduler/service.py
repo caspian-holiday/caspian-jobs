@@ -183,6 +183,9 @@ class SchedulerService:
         if not self.metrics_manager:
             return
         
+        from flask import request
+        from pathlib import Path
+        
         self.metrics_app = Flask(__name__)
         
         @self.metrics_app.route('/metrics')
@@ -198,6 +201,22 @@ class SchedulerService:
         def health():
             """Health check endpoint."""
             return {'status': 'ok'}, 200
+        
+        @self.metrics_app.route('/notebooks')
+        def notebooks_listing():
+            """List available notebooks organized by date."""
+            notebooks_dir = self.metrics_config.get('notebooks_output_directory')
+            if not notebooks_dir:
+                return {'error': 'Notebooks output directory not configured'}, 404
+            return self.metrics_manager.serve_notebook_directory_listing(Path(notebooks_dir))
+        
+        @self.metrics_app.route('/notebooks/<year>/<month>/<day>/<filename>')
+        def notebooks_file(year, month, day, filename):
+            """Serve a notebook file (.ipynb or .html)."""
+            notebooks_dir = self.metrics_config.get('notebooks_output_directory')
+            if not notebooks_dir:
+                return {'error': 'Notebooks output directory not configured'}, 404
+            return self.metrics_manager.serve_notebook_file(Path(notebooks_dir), year, month, day, filename)
         
         def run_server():
             """Run Flask server (blocks)."""

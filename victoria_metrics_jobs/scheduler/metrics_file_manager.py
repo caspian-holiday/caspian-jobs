@@ -291,4 +291,98 @@ class ScrapeOnceMetricsManager:
             logger.info(f"Removed {empty_dirs_removed} empty partition directories")
         
         return removed_dirs
+    
+    def serve_notebook_directory_listing(self, notebooks_dir: Path) -> Response:
+        """Serve directory listing of available notebooks organized by date.
+        
+        Args:
+            notebooks_dir: Directory containing notebook outputs (with YYYY/MM/DD structure)
+            
+        Returns:
+            Flask Response with HTML directory listing
+        """
+        if not notebooks_dir.exists():
+            return Response(
+                "<html><body><h1>Notebooks Directory Not Found</h1></body></html>",
+                mimetype='text/html',
+                status=404
+            )
+        
+        html_parts = ["<html><head><title>Notebooks</title></head><body>"]
+        html_parts.append("<h1>Executed Notebooks</h1>")
+        html_parts.append("<ul>")
+        
+        # Walk through date partitions
+        for year_dir in sorted(notebooks_dir.iterdir()):
+            if not year_dir.is_dir() or not year_dir.name.isdigit():
+                continue
+            for month_dir in sorted(year_dir.iterdir()):
+                if not month_dir.is_dir() or not month_dir.name.isdigit():
+                    continue
+                for day_dir in sorted(month_dir.iterdir()):
+                    if not day_dir.is_dir() or not day_dir.name.isdigit():
+                        continue
+                    
+                    date_str = f"{year_dir.name}/{month_dir.name}/{day_dir.name}"
+                    html_parts.append(f'<li><strong>{date_str}</strong><ul>')
+                    
+                    # List notebooks for this day
+                    for notebook_file in sorted(day_dir.glob("*.ipynb")):
+                        filename = notebook_file.name
+                        html_filename = notebook_file.stem + ".html"
+                        html_path = day_dir / html_filename
+                        
+                        html_parts.append(
+                            f'<li>'
+                            f'<a href="/notebooks/{year_dir.name}/{month_dir.name}/{day_dir.name}/{filename}">{filename}</a> '
+                            f'(<a href="/notebooks/{year_dir.name}/{month_dir.name}/{day_dir.name}/{html_filename}">HTML</a>)'
+                            f'</li>'
+                        )
+                    
+                    html_parts.append("</ul></li>")
+        
+        html_parts.append("</ul></body></html>")
+        return Response("".join(html_parts), mimetype='text/html')
+    
+    def serve_notebook_file(self, notebooks_dir: Path, year: str, month: str, day: str, filename: str) -> Response:
+        """Serve a notebook file (.ipynb or .html).
+        
+        Args:
+            notebooks_dir: Directory containing notebook outputs
+            year: Year (YYYY)
+            month: Month (MM)
+            day: Day (DD)
+            filename: Filename (with extension)
+            
+        Returns:
+            Flask Response with file content
+        """
+        file_path = notebooks_dir / year / month / day / filename
+        
+        if not file_path.exists():
+            return Response(
+                f"File not found: {filename}",
+                mimetype='text/plain',
+                status=404
+            )
+        
+        try:
+            if filename.endswith('.html'):
+                mimetype = 'text/html'
+            elif filename.endswith('.ipynb'):
+                mimetype = 'application/json'
+            else:
+                mimetype = 'application/octet-stream'
+            
+            with open(file_path, 'rb') as f:
+                content = f.read()
+            
+            return Response(content, mimetype=mimetype)
+        except Exception as e:
+            logger.error(f"Error serving notebook file {file_path}: {e}")
+            return Response(
+                f"Error reading file: {str(e)}",
+                mimetype='text/plain',
+                status=500
+            )
 

@@ -62,11 +62,7 @@ environments:
         # Job-specific attributes (read by job config loader)
         job_type: metrics_cleanup
         # Metrics configuration is automatically added from environment.metrics section
-        # Job-specific overrides (optional, for backward compatibility):
-        # metrics_directory: ${environments.local.metrics.directory}
-        # archive_directory: ${environments.local.metrics.archive_directory}
-        # enable_archive: ${environments.local.metrics.enable_archive}
-        # max_age_days: ${environments.local.metrics.retention_days}
+        notebooks_job_id: metrics_forecast_notebooks  # Job ID to get notebooks settings from
       
       system_a_extractor:
         # Scheduler attributes (read by scheduler config loader)
@@ -263,6 +259,30 @@ environments:
         labels:
           env: local
 
+      metrics_forecast_notebooks:
+        # Scheduler attributes
+        id: metrics_forecast_notebooks
+        name: Metrics Forecast Notebooks (Local)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.metrics_forecast_notebooks", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_forecast_notebooks"]
+        schedule:
+          type: cron
+          args:
+            hour: 8
+            minute: 30
+
+        # Job-specific attributes
+        job_type: metrics_forecast_notebooks
+        victoria_metrics: ${environments.local.victoria_metrics}
+        database: ${environments.local.database}
+        notebooks_directory: "notebooks"  # Input: source notebooks to execute (relative to job directory)
+        notebooks_output_directory: ${oc.env:VM_JOBS_NOTEBOOKS_OUTPUT_DIR,/var/lib/scheduler/notebooks_output}
+        notebooks_retention_days: ${oc.env:VM_JOBS_NOTEBOOKS_RETENTION_DAYS,${environments.local.metrics.retention_days}}
+        cutoff_hour: ${oc.env:VM_JOBS_CUTOFF_HOUR,6}
+        labels:
+          env: local
+
   dev:
     # Global scheduler settings
     max_workers: ${oc.env:VM_JOBS_SCHEDULER_MAX_WORKERS,5}
@@ -321,11 +341,7 @@ environments:
         # Job-specific attributes (read by job config loader)
         job_type: metrics_cleanup
         # Metrics configuration is automatically added from environment.metrics section
-        # Job-specific overrides (optional, for backward compatibility):
-        # metrics_directory: ${environments.dev.metrics.directory}
-        # archive_directory: ${environments.dev.metrics.archive_directory}
-        # enable_archive: ${environments.dev.metrics.enable_archive}
-        # max_age_days: ${environments.dev.metrics.retention_days}
+        notebooks_job_id: metrics_forecast_notebooks  # Job ID to get notebooks settings from
       
       system_a_extractor:
         # Scheduler attributes (read by scheduler config loader)
@@ -519,5 +535,29 @@ environments:
         initial_lookback_days: ${oc.env:VM_JOBS_EXTRACT_LOOKBACK_DAYS,30}
         # Business date cutoff hour (default: 6)
         cutoff_hour: ${oc.env:VM_JOBS_EXTRACT_CUTOFF_HOUR,6}
+        labels:
+          env: dev
+
+      metrics_forecast_notebooks:
+        # Scheduler attributes
+        id: metrics_forecast_notebooks
+        name: Metrics Forecast Notebooks (Dev)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.metrics_forecast_notebooks", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_forecast_notebooks"]
+        schedule:
+          type: cron
+          args:
+            hour: 8
+            minute: 30
+
+        # Job-specific attributes
+        job_type: metrics_forecast_notebooks
+        victoria_metrics: ${environments.dev.victoria_metrics}
+        database: ${environments.dev.database}
+        notebooks_directory: "notebooks"  # Input: source notebooks to execute (relative to job directory)
+        notebooks_output_directory: ${oc.env:VM_JOBS_NOTEBOOKS_OUTPUT_DIR,/var/lib/scheduler/notebooks_output}
+        notebooks_retention_days: ${oc.env:VM_JOBS_NOTEBOOKS_RETENTION_DAYS,${environments.dev.metrics.retention_days}}
+        cutoff_hour: ${oc.env:VM_JOBS_CUTOFF_HOUR,6}
         labels:
           env: dev
