@@ -22,10 +22,28 @@ from sqlalchemy.exc import SQLAlchemyError
 
 # Add the scheduler module to the path for imports
 # This allows notebooks to use ConfigLoader
-_helper_dir = Path(__file__).parent
-_project_root = _helper_dir.parent.parent.parent
-if str(_project_root) not in sys.path:
+# Find project root: look for directory containing victoria_metrics_jobs/
+_helper_dir = Path(__file__).parent.resolve()
+_project_root = None
+
+# Try current working directory first (most reliable for notebooks)
+_cwd = Path.cwd()
+if (_cwd / 'victoria_metrics_jobs').exists():
+    _project_root = _cwd
+else:
+    # Walk up from helper directory to find project root
+    _current = _helper_dir
+    for _ in range(6):  # Max 6 levels up
+        if (_current / 'victoria_metrics_jobs').exists():
+            _project_root = _current
+            break
+        _current = _current.parent
+        if _current == _current.parent:  # Reached filesystem root
+            break
+
+if _project_root and str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
+
 from victoria_metrics_jobs.scheduler.config import ConfigLoader
 
 
@@ -41,17 +59,14 @@ def load_database_config_from_yaml(
     3. Overrides the password with VM_JOBS_DB_PASSWORD environment variable
     
     Args:
-        config_path: Path to the YAML configuration file. If None, tries to find it:
-            - Checks VM_JOBS_CONFIG_PATH environment variable
-            - Tries relative path from helper location: ../../../../victoria_metrics_jobs.yml
-            - Tries current working directory: victoria_metrics_jobs/victoria_metrics_jobs.yml
+        config_path: Path to the YAML configuration file (required). Notebooks should read from VM_JOBS_CONFIG_PATH env var and pass it here.
         environment: Environment name ('local', 'dev', 'stg', 'prod'). If None, uses VM_JOBS_ENVIRONMENT env var.
     
     Returns:
         Dictionary with database configuration keys: host, port, name, user, password, ssl_mode
         
     Raises:
-        ValueError: If environment is not set or config file not found
+        ValueError: If environment or config_path is not set
         FileNotFoundError: If config file cannot be found
     """
     # Get environment from parameter or environment variable
@@ -64,27 +79,11 @@ def load_database_config_from_yaml(
             "VM_JOBS_ENVIRONMENT environment variable to 'local', 'dev', 'stg', or 'prod'"
         )
     
-    # Determine config file path
-    if config_path is None:
-        # Try environment variable first
-        config_path = os.getenv('VM_JOBS_CONFIG_PATH')
-        
-        if config_path is None:
-            # Try relative to helper file location
-            candidate = _helper_dir / '../../../../victoria_metrics_jobs.yml'
-            if candidate.resolve().exists():
-                config_path = str(candidate.resolve())
-            else:
-                # Try current working directory
-                candidate = Path('victoria_metrics_jobs/victoria_metrics_jobs.yml')
-                if candidate.exists():
-                    config_path = str(candidate.resolve())
-                else:
-                    raise FileNotFoundError(
-                        "Could not find victoria_metrics_jobs.yml config file. "
-                        "Set VM_JOBS_CONFIG_PATH environment variable or ensure the config file "
-                        "is in the expected location."
-                    )
+    # Config file path must be provided as parameter (notebooks read from env var)
+    if not config_path:
+        raise ValueError(
+            "Configuration file path must be specified. Provide 'config_path' parameter."
+        )
     
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
