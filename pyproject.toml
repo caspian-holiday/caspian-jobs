@@ -21,7 +21,7 @@ flask = "^3.0.0"
 pandas = "^2.1.0"
 prophet = "^1.1.5"
 papermill = "^2.5.0"
-darts = "^0.29.0"
+darts = "^0.39.0"
 nbconvert = "^7.16.0"
 pygments = "^2.17.0"
 

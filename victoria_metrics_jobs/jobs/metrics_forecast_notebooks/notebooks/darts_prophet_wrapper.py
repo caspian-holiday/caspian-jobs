@@ -215,8 +215,11 @@ def train_and_forecast(
     forecast = model.predict(n=forecast_horizon_days)
     
     # Convert forecast back to DataFrame
-    forecast_df = forecast.pd_dataframe().reset_index()
-    forecast_df.columns = ["ds", "yhat"]
+    # In darts 0.39.0+, use time_index and values() to construct DataFrame
+    forecast_df = pd.DataFrame({
+        "ds": forecast.time_index,
+        "yhat": forecast.values().flatten()
+    })
     
     # For Prophet via darts, uncertainty intervals may need to be extracted differently
     # This is a simplified version - adjust based on actual darts Prophet implementation

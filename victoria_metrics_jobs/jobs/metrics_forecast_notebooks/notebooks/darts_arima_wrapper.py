@@ -121,22 +121,29 @@ def train_and_forecast(
             lower = forecast.quantile_timeseries(0.025)
             upper = forecast.quantile_timeseries(0.975)
             
-            forecast_df = forecast.pd_dataframe().reset_index()
-            forecast_df.columns = ["ds", "yhat"]
+            # Convert forecast to DataFrame (darts 0.39.0+)
+            forecast_df = pd.DataFrame({
+                "ds": forecast.time_index,
+                "yhat": forecast.values().flatten()
+            })
             forecast_df["yhat_lower"] = lower.values().flatten()
             forecast_df["yhat_upper"] = upper.values().flatten()
         else:
             # Fallback: just mean forecast
-            forecast_df = forecast.pd_dataframe().reset_index()
-            forecast_df.columns = ["ds", "yhat"]
+            forecast_df = pd.DataFrame({
+                "ds": forecast.time_index,
+                "yhat": forecast.values().flatten()
+            })
             std = forecast_df["yhat"].std() if len(forecast_df) > 1 else abs(forecast_df["yhat"].iloc[0] * 0.1)
             forecast_df["yhat_lower"] = forecast_df["yhat"] - 1.96 * std
             forecast_df["yhat_upper"] = forecast_df["yhat"] + 1.96 * std
     except Exception as e:
         # Fallback: simple forecast
         forecast = model.predict(n=forecast_horizon_days)
-        forecast_df = forecast.pd_dataframe().reset_index()
-        forecast_df.columns = ["ds", "yhat"]
+        forecast_df = pd.DataFrame({
+            "ds": forecast.time_index,
+            "yhat": forecast.values().flatten()
+        })
         std = forecast_df["yhat"].std() if len(forecast_df) > 1 else abs(forecast_df["yhat"].iloc[0] * 0.1)
         forecast_df["yhat_lower"] = forecast_df["yhat"] - 1.96 * std
         forecast_df["yhat_upper"] = forecast_df["yhat"] + 1.96 * std
