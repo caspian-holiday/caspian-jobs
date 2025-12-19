@@ -348,6 +348,7 @@ class MetricsForecastNotebooksJob(BaseJob):
                     str(input_path),
                     str(output_path),
                     parameters=notebook_parameters,
+                    kernel_name='python3',  # Explicitly specify kernel to avoid "no kernel name" error
                     log_output=True,
                     stdout_file=None,  # Don't capture stdout
                     stderr_file=None,  # Don't capture stderr
