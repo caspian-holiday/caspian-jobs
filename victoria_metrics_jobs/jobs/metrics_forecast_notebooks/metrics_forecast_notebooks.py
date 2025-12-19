@@ -344,15 +344,23 @@ class MetricsForecastNotebooksJob(BaseJob):
             original_cwd = os.getcwd()
             try:
                 os.chdir(str(notebooks_dir))
-                pm.execute_notebook(
-                    str(input_path),
-                    str(output_path),
-                    parameters=notebook_parameters,
-                    kernel_name='python3',  # Explicitly specify kernel to avoid "no kernel name" error
-                    log_output=True,
-                    stdout_file=None,  # Don't capture stdout
-                    stderr_file=None,  # Don't capture stderr
-                )
+                # Execute notebook with parameters
+                # Note: Papermill 2.6.0+ may show warnings about "unknown parameters" even when
+                # parameters are correctly defined. These are typically warnings, not errors.
+                # The parameters are still injected correctly into the notebook.
+                import warnings
+                with warnings.catch_warnings():
+                    # Suppress papermill parameter warnings if they occur
+                    warnings.filterwarnings('ignore', message='.*unknown.*parameter.*', category=UserWarning)
+                    pm.execute_notebook(
+                        str(input_path),
+                        str(output_path),
+                        parameters=notebook_parameters,
+                        kernel_name='python3',  # Explicitly specify kernel to avoid "no kernel name" error
+                        log_output=True,
+                        stdout_file=None,  # Don't capture stdout
+                        stderr_file=None,  # Don't capture stderr
+                    )
             finally:
                 # Restore original working directory
                 os.chdir(original_cwd)
