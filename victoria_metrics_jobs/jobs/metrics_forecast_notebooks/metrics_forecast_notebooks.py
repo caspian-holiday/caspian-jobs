@@ -12,10 +12,8 @@ The job:
 
 from __future__ import annotations
 
-import json
 import os
 import sys
-import subprocess
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -331,21 +329,32 @@ class MetricsForecastNotebooksJob(BaseJob):
             environment = os.getenv('VM_JOBS_ENVIRONMENT', '')
             
             # Prepare parameters to inject into notebook
+            # Note: All parameters defined in the notebook's parameters cell must be passed
+            # to avoid papermill warnings about unknown parameters
             notebook_parameters = {
                 "vm_query_url": state.vm_query_url,
                 "vm_token": state.vm_token,
                 "vm_jobs_environment": environment,
+                "dry_run": False,  # Default to False for production runs
             }
 
             # Execute notebook with parameters
-            pm.execute_notebook(
-                str(input_path),
-                str(output_path),
-                parameters=notebook_parameters,
-                log_output=True,
-                stdout_file=None,  # Don't capture stdout
-                stderr_file=None,  # Don't capture stderr
-            )
+            # Set working directory to the notebook's directory so imports work correctly
+            notebooks_dir = input_path.parent
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(str(notebooks_dir))
+                pm.execute_notebook(
+                    str(input_path),
+                    str(output_path),
+                    parameters=notebook_parameters,
+                    log_output=True,
+                    stdout_file=None,  # Don't capture stdout
+                    stderr_file=None,  # Don't capture stderr
+                )
+            finally:
+                # Restore original working directory
+                os.chdir(original_cwd)
 
             execution_time = time.time() - start_time
 
