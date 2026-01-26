@@ -10,7 +10,7 @@ import os
 import json
 import time
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from datetime import date, datetime, timedelta
 
 from .database import DatabaseManager
@@ -22,20 +22,17 @@ class JobExecutor:
     def __init__(
         self,
         database_manager: Optional[DatabaseManager],
-        config_path: str,
-        metrics_manager: Optional[Any] = None
+        config_path: str
     ):
         """Initialize the job executor.
         
         Args:
             database_manager: Database manager for advisory locks (optional)
             config_path: Path to the configuration file (required)
-            metrics_manager: ScrapeOnceMetricsManager instance for writing metrics (optional)
         """
         self.logger = logging.getLogger(__name__)
         self.database_manager = database_manager
         self.config_path = config_path
-        self.metrics_manager = metrics_manager
     
     def execute_job(self, job_config: Dict[str, Any]):
         """Execute a job script based on its configuration with advisory locking.
@@ -84,61 +81,33 @@ class JobExecutor:
             self.logger.error(f"Job {job_id} failed: {e}")
             raise
         finally:
-            # Extract and write metrics
-            if self.metrics_manager:
-                try:
-                    business_date = self._get_current_business_date()
-                    
-                    # Parse job results from JSON output
-                    job_results = self._parse_job_results(stdout_output, stderr_output)
-                    
-                    # Extract timestamps and runtime from JSON (if available)
-                    # Jobs return started_at and completed_at as ISO strings
-                    job_start_timestamp = start_timestamp  # Fallback to our tracked time
-                    job_end_timestamp = end_timestamp  # Fallback to our tracked time
-                    runtime_seconds = end_timestamp - start_timestamp  # Fallback
-                    
-                    if job_results:
-                        # Try to get timestamps from JSON (ISO format strings)
-                        if 'started_at' in job_results and job_results['started_at']:
-                            try:
-                                job_start_timestamp = datetime.fromisoformat(
-                                    job_results['started_at'].replace('Z', '+00:00')
-                                ).timestamp()
-                            except (ValueError, AttributeError):
-                                pass
-                        
-                        if 'completed_at' in job_results and job_results['completed_at']:
-                            try:
-                                job_end_timestamp = datetime.fromisoformat(
-                                    job_results['completed_at'].replace('Z', '+00:00')
-                                ).timestamp()
-                            except (ValueError, AttributeError):
-                                pass
-                        
-                        # Use execution_time_seconds from JSON if available
-                        if 'execution_time_seconds' in job_results:
-                            runtime_seconds = job_results['execution_time_seconds']
-                        
-                        # Get status from JSON if available (more accurate)
-                        if 'status' in job_results:
-                            status = job_results['status']
-                    
-                    # Extract job-specific metrics
-                    processed_entries = self._extract_job_metrics(job_results, job_type, job_id)
-                    
-                    # Write metrics to file
-                    self.metrics_manager.append_job_metrics(
-                        job_id=job_id,
-                        business_date=business_date,
-                        start_timestamp=job_start_timestamp,
-                        end_timestamp=job_end_timestamp,
-                        runtime_seconds=runtime_seconds,
-                        status=status,
-                        processed_entries=processed_entries
-                    )
-                except Exception as metrics_error:
-                    self.logger.warning(f"Failed to write metrics for job {job_id}: {metrics_error}")
+            # Extract and write metrics to Victoria Metrics
+            try:
+                # Parse job results from JSON output
+                job_results = self._parse_job_results(stdout_output, stderr_output)
+                
+                # Calculate runtime in milliseconds
+                run_time_ms = int((end_timestamp - start_timestamp) * 1000)
+                
+                # Convert timestamps to milliseconds
+                start_time_ms = int(start_timestamp * 1000)
+                end_time_ms = int(end_timestamp * 1000)
+                
+                # Extract job-specific metrics
+                processed_metrics, failed_metrics = self._extract_job_metrics(job_results, job_type, job_id)
+                
+                # Write metrics to Victoria Metrics
+                self._write_metrics_to_vm(
+                    job_config=job_config,
+                    job_id=job_id,
+                    start_time_ms=start_time_ms,
+                    end_time_ms=end_time_ms,
+                    run_time_ms=run_time_ms,
+                    processed_metrics=processed_metrics,
+                    failed_metrics=failed_metrics
+                )
+            except Exception as metrics_error:
+                self.logger.warning(f"Failed to write metrics for job {job_id}: {metrics_error}")
     
     def _execute_python_job(self, job_config: Dict[str, Any]):
         """Execute a Python script job.
@@ -257,80 +226,198 @@ class JobExecutor:
         job_results: Optional[Dict[str, Any]],
         job_type: str,
         job_id: str
-    ) -> Optional[int]:
-        """Extract job-specific processed entries metric from job results.
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """Extract job-specific processed and failed metrics from job results.
         
         Based on actual JSON structure returned by each job type.
         
         Args:
             job_results: Parsed JSON results from job execution
-            job_type: Type of job (apex_collector, extractor, metrics_forecast, metrics_extract)
+            job_type: Type of job (apex_collector, extractor, metrics_forecast, metrics_extract, etc.)
             job_id: Job identifier (for logging)
             
         Returns:
-            Number of processed entries or None if not available
+            Tuple of (processed_metrics, failed_metrics) - both can be None if not available
         """
+        processed_metrics = None
+        failed_metrics = None
+        
         if not job_results:
-            return None
+            return None, None
         
         try:
-            # Extract based on job_type and actual JSON fields
+            # Extract processed metrics based on job_type
             if job_type == 'apex_collector':
                 # apex_collector returns:
                 # - apex_data_collected: number of apex data items collected
-                # - processed_count: number of successful processing operations
-                # We want: apex_data_collected (metrics extracted and saved to VM)
                 value = job_results.get('apex_data_collected')
                 if value is not None:
-                    return int(value) if isinstance(value, (int, float)) else None
+                    processed_metrics = int(value) if isinstance(value, (int, float)) else None
+                # failed_count: number of failed processing operations
+                failed_value = job_results.get('failed_count')
+                if failed_value is not None:
+                    failed_metrics = int(failed_value) if isinstance(failed_value, (int, float)) else None
             
             elif job_type == 'extractor':
                 # extractor returns:
                 # - metrics_saved_count: metrics saved to database
-                # We want: metrics_saved_count
                 value = job_results.get('metrics_saved_count')
                 if value is not None:
-                    return int(value) if isinstance(value, (int, float)) else None
+                    processed_metrics = int(value) if isinstance(value, (int, float)) else None
             
             elif job_type == 'metrics_forecast':
                 # metrics_forecast returns:
                 # - series_processed: number of series forecasted
-                # - forecasts_written: number of forecast samples written
-                # We want: series_processed (number of metric series that were forecasted)
                 value = job_results.get('series_processed')
                 if value is not None:
-                    return int(value) if isinstance(value, (int, float)) else None
+                    processed_metrics = int(value) if isinstance(value, (int, float)) else None
+                # failed_series: number of failed series
+                failed_value = job_results.get('failed_series')
+                if failed_value is not None:
+                    failed_metrics = int(failed_value) if isinstance(failed_value, (int, float)) else None
             
             elif job_type == 'metrics_extract':
                 # metrics_extract returns:
                 # - metrics_saved_count: metrics saved to database
-                # - series_processed: number of series processed
-                # We want: metrics_saved_count (number of metrics saved to database)
                 value = job_results.get('metrics_saved_count')
                 if value is not None:
-                    return int(value) if isinstance(value, (int, float)) else None
+                    processed_metrics = int(value) if isinstance(value, (int, float)) else None
+                # failed_series: number of failed series
+                failed_value = job_results.get('failed_series')
+                if failed_value is not None:
+                    failed_metrics = int(failed_value) if isinstance(failed_value, (int, float)) else None
+            
+            elif job_type == 'business_date_converter':
+                # business_date_converter returns:
+                # - metrics_converted: number of metrics converted
+                value = job_results.get('metrics_converted')
+                if value is not None:
+                    processed_metrics = int(value) if isinstance(value, (int, float)) else None
+                # failed_count: number of failed conversions
+                failed_value = job_results.get('failed_count')
+                if failed_value is not None:
+                    failed_metrics = int(failed_value) if isinstance(failed_value, (int, float)) else None
             
             else:
                 # Unknown job type, try common field names in order of preference
-                for field in ['metrics_saved_count', 'series_processed', 'processed_count', 'apex_data_collected', 'processed_entries']:
+                for field in ['number_of_processed_metrics', 'metrics_saved_count', 'series_processed', 'processed_count', 'apex_data_collected', 'processed_entries', 'metrics_converted']:
                     if field in job_results:
                         value = job_results.get(field)
                         if value is not None:
-                            return int(value) if isinstance(value, (int, float)) else None
+                            processed_metrics = int(value) if isinstance(value, (int, float)) else None
+                            break
+                
+                # Try to find failed metrics
+                for field in ['number_of_failed_metrics', 'failed_count', 'failed_series']:
+                    if field in job_results:
+                        failed_value = job_results.get(field)
+                        if failed_value is not None:
+                            failed_metrics = int(failed_value) if isinstance(failed_value, (int, float)) else None
+                            break
         
         except (AttributeError, TypeError, ValueError) as e:
             self.logger.warning(f"Error extracting metrics for job {job_id}: {e}")
         
-        return None
+        return processed_metrics, failed_metrics
     
-    def _get_current_business_date(self) -> str:
-        """Get current business date (today, or last weekday if weekend).
+    def _write_metrics_to_vm(
+        self,
+        job_config: Dict[str, Any],
+        job_id: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        run_time_ms: int,
+        processed_metrics: Optional[int],
+        failed_metrics: Optional[int]
+    ):
+        """Write job execution metrics to Victoria Metrics.
         
-        Returns:
-            ISO format date string (YYYY-MM-DD)
+        Args:
+            job_config: Job configuration dictionary
+            job_id: Job identifier (used as vmj_job label)
+            start_time_ms: Job start timestamp in milliseconds
+            end_time_ms: Job end timestamp in milliseconds
+            run_time_ms: Job execution duration in milliseconds
+            processed_metrics: Number of processed metrics (optional)
+            failed_metrics: Number of failed metrics (optional)
         """
-        today = date.today()
-        # If weekend, use last Friday
-        while today.weekday() >= 5:  # Saturday=5, Sunday=6
-            today -= timedelta(days=1)
-        return today.isoformat()
+        try:
+            # Get Victoria Metrics configuration from job config or environment config
+            vm_config = job_config.get('victoria_metrics', {})
+            
+            # If not in job config, try to get from environment config
+            if not vm_config or not vm_config.get('gateway_url'):
+                # Try to load environment config
+                try:
+                    from .config import ConfigLoader
+                    config_loader = ConfigLoader()
+                    env_config = config_loader.load(self.config_path)
+                    vm_config = env_config.get('victoria_metrics', {})
+                except Exception as e:
+                    self.logger.debug(f"Could not load environment config for VM: {e}")
+            
+            gateway_url = vm_config.get('gateway_url', '')
+            if not gateway_url:
+                self.logger.debug(f"Victoria Metrics gateway URL not configured for job {job_id}, skipping metric write")
+                return
+            
+            # Build Prometheus text format metrics
+            metrics_lines = []
+            
+            # vmj_run_time
+            metrics_lines.append(f'vmj_run_time{{job="vmj",vmj_job="{job_id}"}} {run_time_ms}')
+            
+            # vmj_start_time
+            metrics_lines.append(f'vmj_start_time{{job="vmj",vmj_job="{job_id}"}} {start_time_ms}')
+            
+            # vmj_end_time
+            metrics_lines.append(f'vmj_end_time{{job="vmj",vmj_job="{job_id}"}} {end_time_ms}')
+            
+            # vmj_number_of_processed_metrics (if available)
+            if processed_metrics is not None:
+                metrics_lines.append(f'vmj_number_of_processed_metrics{{job="vmj",vmj_job="{job_id}"}} {processed_metrics}')
+            
+            # vmj_number_of_failed_metrics (if available)
+            if failed_metrics is not None:
+                metrics_lines.append(f'vmj_number_of_failed_metrics{{job="vmj",vmj_job="{job_id}"}} {failed_metrics}')
+            
+            if not metrics_lines:
+                return
+            
+            # Join metrics with newlines
+            metrics_payload = '\n'.join(metrics_lines) + '\n'
+            
+            # Prepare HTTP request
+            import requests
+            
+            # Ensure gateway_url doesn't have /api/v1/import/prometheus if it's already in the URL
+            if gateway_url.endswith('/api/v1/import/prometheus'):
+                import_url = gateway_url
+            elif gateway_url.endswith('/api/v1/write'):
+                # Replace /write with /import/prometheus
+                import_url = gateway_url.replace('/api/v1/write', '/api/v1/import/prometheus')
+            else:
+                # Append the endpoint
+                import_url = f"{gateway_url.rstrip('/')}/api/v1/import/prometheus"
+            
+            headers = {'Content-Type': 'text/plain'}
+            vm_token = vm_config.get('token', '')
+            if vm_token:
+                headers['Authorization'] = f'Bearer {vm_token}'
+            
+            # Write metrics to Victoria Metrics
+            timeout = vm_config.get('timeout', 30)
+            response = requests.post(
+                import_url,
+                data=metrics_payload,
+                headers=headers,
+                timeout=timeout
+            )
+            response.raise_for_status()
+            
+            self.logger.debug(f"Successfully wrote metrics to Victoria Metrics for job {job_id}")
+            
+        except ImportError:
+            self.logger.warning(f"requests library not available, cannot write metrics to Victoria Metrics for job {job_id}")
+        except Exception as e:
+            self.logger.warning(f"Failed to write metrics to Victoria Metrics for job {job_id}: {e}")

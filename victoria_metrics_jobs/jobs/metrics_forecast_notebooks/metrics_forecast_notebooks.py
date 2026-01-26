@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional
 # Add the scheduler module to the path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from victoria_metrics_jobs.jobs.common import BaseJob, BaseJobState, Err, Ok, Result
-from victoria_metrics_jobs.scheduler.metrics_file_manager import ScrapeOnceMetricsManager
+from victoria_metrics_jobs.scheduler.notebooks_file_manager import NotebooksFileManager
 
 
 @dataclass
@@ -209,15 +209,14 @@ class MetricsForecastNotebooksJob(BaseJob):
                 self.logger.info("No notebooks to execute")
                 return Ok(state)
 
-            # Get partition path for output (using same structure as metrics)
+            # Get partition path for output (using same structure as notebooks)
             business_date_str = state.current_business_date.isoformat()
-            metrics_manager = ScrapeOnceMetricsManager(
-                metrics_dir=str(state.notebooks_output_dir),
+            notebooks_manager = NotebooksFileManager(
+                notebooks_dir=str(state.notebooks_output_dir),
                 archive_dir=None,
                 enable_archive=False,
             )
-            partition_dir = metrics_manager._get_partition_path(business_date_str)
-            partition_dir.mkdir(parents=True, exist_ok=True)
+            partition_dir = notebooks_manager._get_partition_path(business_date_str)
 
             # Execute each notebook
             for notebook_rel_path in state.notebooks_found:
