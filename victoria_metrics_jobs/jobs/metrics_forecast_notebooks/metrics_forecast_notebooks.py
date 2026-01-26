@@ -40,6 +40,8 @@ class MetricsForecastNotebooksState(BaseJobState):
     vm_query_url: str = ""
     vm_token: str = ""
     db_connection_string: str = ""
+    papermill_start_timeout: int = 300  # Timeout for kernel startup (seconds)
+    papermill_execution_timeout: Optional[int] = None  # Timeout for cell execution (None = no timeout)
 
     def to_results(self) -> Dict[str, Any]:
         """Extend base results with notebook execution metadata."""
@@ -85,6 +87,12 @@ class MetricsForecastNotebooksJob(BaseJob):
                 job_config.get("notebooks_output_directory", "/var/lib/scheduler/notebooks_output"),
             )
             notebooks_output_dir_path = Path(notebooks_output_dir)
+            
+            # Get timeout settings for papermill execution
+            # start_timeout: time to wait for kernel to start (default: 60s, increase for slow systems)
+            # execution_timeout: time to wait for each cell execution (default: None = no timeout)
+            papermill_start_timeout = job_config.get("papermill_start_timeout", 300)  # 5 minutes default
+            papermill_execution_timeout = job_config.get("papermill_execution_timeout", None)  # No timeout by default
 
             # Get Victoria Metrics and database config for notebook parameters
             victoria_metrics_cfg = job_config.get("victoria_metrics", {})
@@ -99,6 +107,8 @@ class MetricsForecastNotebooksJob(BaseJob):
                 vm_query_url=victoria_metrics_cfg.get("query_url", ""),
                 vm_token=victoria_metrics_cfg.get("token", ""),
                 db_connection_string=self._build_database_connection_string(database_cfg) if database_cfg else "",
+                papermill_start_timeout=papermill_start_timeout,
+                papermill_execution_timeout=papermill_execution_timeout,
             )
 
             self.logger.info(
@@ -351,15 +361,29 @@ class MetricsForecastNotebooksJob(BaseJob):
                 with warnings.catch_warnings():
                     # Suppress papermill parameter warnings if they occur
                     warnings.filterwarnings('ignore', message='.*unknown.*parameter.*', category=UserWarning)
-                    pm.execute_notebook(
-                        str(input_path),
-                        str(output_path),
-                        parameters=notebook_parameters,
-                        kernel_name='python3',  # Explicitly specify kernel to avoid "no kernel name" error
-                        log_output=True,
-                        stdout_file=None,  # Don't capture stdout
-                        stderr_file=None,  # Don't capture stderr
+                    
+                    # Prepare execute_notebook arguments
+                    execute_kwargs = {
+                        'input_path': str(input_path),
+                        'output_path': str(output_path),
+                        'parameters': notebook_parameters,
+                        'kernel_name': 'python3',  # Explicitly specify kernel to avoid "no kernel name" error
+                        'log_output': True,
+                        'stdout_file': None,  # Don't capture stdout
+                        'stderr_file': None,  # Don't capture stderr
+                        'start_timeout': state.papermill_start_timeout,  # Timeout for kernel startup
+                    }
+                    
+                    # Add execution_timeout only if specified (None means no timeout)
+                    if state.papermill_execution_timeout is not None:
+                        execute_kwargs['execution_timeout'] = state.papermill_execution_timeout
+                    
+                    self.logger.info(
+                        f"Executing notebook with start_timeout={state.papermill_start_timeout}s, "
+                        f"execution_timeout={'unlimited' if state.papermill_execution_timeout is None else f'{state.papermill_execution_timeout}s'}"
                     )
+                    
+                    pm.execute_notebook(**execute_kwargs)
             finally:
                 # Restore original working directory
                 os.chdir(original_cwd)
