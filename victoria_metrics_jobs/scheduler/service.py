@@ -276,7 +276,9 @@ class SchedulerService:
                     **schedule.get('args', {})
                 )
                 
-                self.logger.info(f"Added job: {job_id} (script: {script})")
+                # Format schedule in human-readable form
+                schedule_str = self._format_schedule(schedule)
+                self.logger.info(f"Added job: {job_id} (script: {script}, schedule: {schedule_str})")
                 jobs_added += 1
                 
             except Exception as e:
@@ -284,6 +286,60 @@ class SchedulerService:
         
         if jobs_added == 0:
             self.logger.info("No enabled jobs found - scheduler will run with no scheduled jobs")
+    
+    def _format_schedule(self, schedule: Dict[str, Any]) -> str:
+        """Format schedule configuration in human-readable form.
+        
+        Args:
+            schedule: Schedule configuration dictionary
+            
+        Returns:
+            Human-readable schedule description
+        """
+        schedule_type = schedule.get('type', 'cron')
+        args = schedule.get('args', {})
+        
+        if schedule_type == 'cron':
+            try:
+                from cron_descriptor import get_description, CasingTypeEnum
+                
+                # Convert APScheduler keyword args to cron expression: minute hour day month day_of_week
+                minute = str(args.get('minute', '*'))
+                hour = str(args.get('hour', '*'))
+                day = str(args.get('day', '*'))
+                month = str(args.get('month', '*'))
+                day_of_week = args.get('day_of_week', '*')
+                
+                # Handle lists/ranges for day_of_week
+                if isinstance(day_of_week, (list, tuple)):
+                    day_of_week = ','.join(str(d) for d in day_of_week)
+                else:
+                    day_of_week = str(day_of_week)
+                
+                cron_expr = f"{minute} {hour} {day} {month} {day_of_week}"
+                return get_description(cron_expr, casing_type=CasingTypeEnum.Sentence)
+            except ImportError:
+                # Fallback if cron-descriptor not available
+                hour = args.get('hour', '*')
+                minute = args.get('minute', '*')
+                return f"daily at {int(hour):02d}:{int(minute):02d}" if hour != '*' and minute != '*' else "daily"
+        
+        elif schedule_type == 'interval':
+            # Simple interval formatting
+            parts = []
+            for unit in ['weeks', 'days', 'hours', 'minutes', 'seconds']:
+                if unit in args:
+                    val = args[unit]
+                    unit_name = unit.rstrip('s') if val == 1 else unit
+                    parts.append(f"{val} {unit_name}")
+            return f"every {', '.join(parts)}" if parts else "interval"
+        
+        elif schedule_type == 'date':
+            run_date = args.get('run_date', 'unspecified')
+            return f"on {run_date}"
+        
+        else:
+            return f"{schedule_type}"
     
     def _job_executed(self, event):
         """Handle successful job execution."""

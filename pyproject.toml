@@ -12,6 +12,7 @@ keywords = ["victoria-metrics", "scheduler", "monitoring", "jobs"]
 [tool.poetry.dependencies]
 python = "^3.9"
 apscheduler = "^3.10.4"
+cron-descriptor = "^1.2.30"
 omegaconf = "^2.3.0"
 requests = "^2.31.0"
 sqlalchemy = "^2.0.0"
