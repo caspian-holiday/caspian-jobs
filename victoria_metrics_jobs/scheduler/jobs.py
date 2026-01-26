@@ -191,6 +191,8 @@ class JobExecutor:
         """Parse JSON output from job execution.
         
         Jobs output JSON results to stdout. This method extracts and parses it.
+        Handles cases where log messages are mixed with JSON output by finding
+        the JSON object and extracting it even if log lines appear before, after, or between JSON lines.
         
         Args:
             stdout: Standard output from job execution
@@ -202,23 +204,103 @@ class JobExecutor:
         if not stdout or not stdout.strip():
             return None
         
+        # First, try to parse the entire stdout as JSON (in case it's clean JSON)
         try:
-            # Try to parse JSON from stdout
-            # Jobs output JSON, so we should be able to parse it directly
             job_results = json.loads(stdout.strip())
             return job_results
         except json.JSONDecodeError:
-            # Try to find JSON in the output (might have log messages before/after)
-            try:
-                # Look for JSON object in output
-                json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', stdout, re.DOTALL)
-                if json_match:
-                    job_results = json.loads(json_match.group(0))
-                    return job_results
-            except (json.JSONDecodeError, AttributeError):
-                pass
+            pass
         
-        self.logger.warning("Failed to parse JSON from job output")
+        # If that fails, find the JSON object by tracking brace balance
+        # This handles log messages before, after, or even between JSON lines
+        try:
+            lines = stdout.split('\n')
+            json_start = None
+            brace_count = 0
+            json_lines = []
+            in_json = False
+            
+            for line in lines:
+                # Check if this line contains part of the JSON
+                if '{' in line or in_json:
+                    if not in_json:
+                        # Find where JSON starts in this line
+                        json_start_idx = line.find('{')
+                        if json_start_idx >= 0:
+                            in_json = True
+                            # Start collecting from the opening brace
+                            json_lines.append(line[json_start_idx:])
+                            brace_count = line[json_start_idx:].count('{') - line[json_start_idx:].count('}')
+                        else:
+                            # Already in JSON but no { in this line, might be continuation
+                            json_lines.append(line)
+                            brace_count += line.count('{') - line.count('}')
+                    else:
+                        # Already collecting JSON, add this line
+                        json_lines.append(line)
+                        brace_count += line.count('{') - line.count('}')
+                    
+                    # Check if JSON is complete (balanced braces)
+                    if in_json and brace_count == 0:
+                        # Found complete JSON object
+                        json_str = '\n'.join(json_lines)
+                        try:
+                            job_results = json.loads(json_str)
+                            return job_results
+                        except json.JSONDecodeError:
+                            # Might be incomplete, continue collecting
+                            pass
+        except (AttributeError, IndexError) as e:
+            self.logger.debug(f"Error parsing JSON by line tracking: {e}")
+        
+        # Alternative approach: find JSON by looking for the last complete JSON object
+        # This works when JSON is at the end of output
+        try:
+            # Reverse search: find the last { and work forward to find complete object
+            last_brace_idx = stdout.rfind('{')
+            if last_brace_idx >= 0:
+                # Extract from this point and try to find complete JSON
+                remaining = stdout[last_brace_idx:]
+                brace_count = 0
+                json_end = None
+                
+                for i, char in enumerate(remaining):
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_end = i + 1
+                            break
+                
+                if json_end:
+                    json_str = remaining[:json_end]
+                    job_results = json.loads(json_str)
+                    return job_results
+        except (json.JSONDecodeError, AttributeError, IndexError) as e:
+            self.logger.debug(f"Error parsing JSON by reverse search: {e}")
+        
+        # Last resort: try to find any JSON-like structure using regex
+        # This is less reliable but might catch edge cases
+        try:
+            # Look for JSON object pattern, handling nested structures
+            # Match from { to } with balanced braces
+            pattern = r'\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}[^{}]*)*\}[^{}]*)*\}'
+            json_match = re.search(pattern, stdout, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                job_results = json.loads(json_str)
+                return job_results
+        except (json.JSONDecodeError, AttributeError) as e:
+            self.logger.debug(f"Error parsing JSON by regex: {e}")
+        
+        # Log a preview of what we received for debugging
+        stdout_preview = stdout[:500] if stdout else "empty"
+        self.logger.warning(
+            "Failed to parse JSON from job output. "
+            f"stdout length: {len(stdout) if stdout else 0}, "
+            f"preview: {stdout_preview}"
+        )
         return None
     
     def _extract_job_metrics(
@@ -298,9 +380,22 @@ class JobExecutor:
                 if failed_value is not None:
                     failed_metrics = int(failed_value) if isinstance(failed_value, (int, float)) else None
             
+            elif job_type == 'metrics_forecast_notebooks':
+                # metrics_forecast_notebooks returns:
+                # - notebooks_executed: number of notebooks executed
+                # - notebooks_succeeded: number of successful executions
+                # We use notebooks_executed as processed_metrics
+                value = job_results.get('notebooks_executed')
+                if value is not None:
+                    processed_metrics = int(value) if isinstance(value, (int, float)) else None
+                # notebooks_failed: number of failed notebook executions
+                failed_value = job_results.get('notebooks_failed')
+                if failed_value is not None:
+                    failed_metrics = int(failed_value) if isinstance(failed_value, (int, float)) else None
+            
             else:
                 # Unknown job type, try common field names in order of preference
-                for field in ['number_of_processed_metrics', 'metrics_saved_count', 'series_processed', 'processed_count', 'apex_data_collected', 'processed_entries', 'metrics_converted']:
+                for field in ['number_of_processed_metrics', 'metrics_saved_count', 'series_processed', 'processed_count', 'apex_data_collected', 'processed_entries', 'metrics_converted', 'notebooks_executed']:
                     if field in job_results:
                         value = job_results.get(field)
                         if value is not None:
@@ -308,7 +403,7 @@ class JobExecutor:
                             break
                 
                 # Try to find failed metrics
-                for field in ['number_of_failed_metrics', 'failed_count', 'failed_series']:
+                for field in ['number_of_failed_metrics', 'failed_count', 'failed_series', 'notebooks_failed']:
                     if field in job_results:
                         failed_value = job_results.get(field)
                         if failed_value is not None:
