@@ -35,6 +35,8 @@ class MetricsForecastNotebooksState(BaseJobState):
     notebooks_executed: int = 0
     notebooks_succeeded: int = 0
     notebooks_failed: int = 0
+    timeseries_processed: int = 0  # Total timeseries with successful forecast (across all notebooks)
+    timeseries_failed: int = 0  # Total timeseries skipped/failed (across all notebooks)
     execution_results: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     current_business_date: Optional[date] = None
     vm_query_url: str = ""
@@ -52,6 +54,8 @@ class MetricsForecastNotebooksState(BaseJobState):
                 "notebooks_executed": self.notebooks_executed,
                 "notebooks_succeeded": self.notebooks_succeeded,
                 "notebooks_failed": self.notebooks_failed,
+                "timeseries_processed": self.timeseries_processed,
+                "timeseries_failed": self.timeseries_failed,
                 "current_business_date": self.current_business_date.isoformat()
                 if self.current_business_date
                 else None,
@@ -243,8 +247,13 @@ class MetricsForecastNotebooksJob(BaseJob):
                         "Executing notebook: %s -> %s", notebook_path, output_path
                     )
 
+                    # Path for notebook to write timeseries_processed / timeseries_failed
+                    output_results_path = partition_dir / f"{output_path.stem}_results.json"
+
                     # Execute notebook using papermill
-                    result = self._execute_with_papermill(notebook_path, output_path, state)
+                    result = self._execute_with_papermill(
+                        notebook_path, output_path, state, output_results_path
+                    )
 
                     if result["success"]:
                         # Generate HTML version
@@ -252,12 +261,20 @@ class MetricsForecastNotebooksJob(BaseJob):
                         self._convert_to_html(output_path, html_output_path)
 
                         state.notebooks_succeeded += 1
-                        state.execution_results[notebook_rel_path] = {
+                        exec_result = {
                             "status": "success",
                             "output_path": str(output_path),
                             "html_path": str(html_output_path),
                             "execution_time": result.get("execution_time", 0),
                         }
+                        # Add timeseries counts if notebook wrote results
+                        if result.get("timeseries_processed") is not None:
+                            exec_result["timeseries_processed"] = result["timeseries_processed"]
+                            state.timeseries_processed += result["timeseries_processed"]
+                        if result.get("timeseries_failed") is not None:
+                            exec_result["timeseries_failed"] = result["timeseries_failed"]
+                            state.timeseries_failed += result["timeseries_failed"]
+                        state.execution_results[notebook_rel_path] = exec_result
                         self.logger.info(
                             "Successfully executed notebook: %s", notebook_rel_path
                         )
@@ -325,12 +342,21 @@ class MetricsForecastNotebooksJob(BaseJob):
         return connection_string
 
     def _execute_with_papermill(
-        self, input_path: Path, output_path: Path, state: MetricsForecastNotebooksState
+        self,
+        input_path: Path,
+        output_path: Path,
+        state: MetricsForecastNotebooksState,
+        output_results_path: Optional[Path] = None,
     ) -> Dict[str, Any]:
-        """Execute notebook using papermill with injected parameters."""
+        """Execute notebook using papermill with injected parameters.
+        
+        If output_results_path is set, the notebook may write a JSON file with
+        timeseries_processed and timeseries_failed; those are read and returned.
+        """
         try:
             import papermill as pm
             import time
+            import json
 
             start_time = time.time()
 
@@ -345,6 +371,7 @@ class MetricsForecastNotebooksJob(BaseJob):
                 "vm_token": state.vm_token,
                 "vm_jobs_environment": environment,
                 "dry_run": False,  # Default to False for production runs
+                "output_results_path": str(output_results_path) if output_results_path else "",
             }
 
             # Execute notebook with parameters
@@ -390,10 +417,24 @@ class MetricsForecastNotebooksJob(BaseJob):
 
             execution_time = time.time() - start_time
 
-            return {
+            out = {
                 "success": True,
                 "execution_time": execution_time,
             }
+            # Read notebook results file if present (timeseries_processed, timeseries_failed)
+            if output_results_path and output_results_path.exists():
+                try:
+                    with open(output_results_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    out["timeseries_processed"] = data.get("timeseries_processed")
+                    out["timeseries_failed"] = data.get("timeseries_failed")
+                except Exception as read_err:
+                    self.logger.debug(
+                        "Could not read notebook results file %s: %s",
+                        output_results_path,
+                        read_err,
+                    )
+            return out
 
         except ImportError:
             self.logger.error("papermill not installed")

@@ -331,11 +331,15 @@ class JobExecutor:
             # Extract processed metrics based on job_type
             if job_type == 'apex_collector':
                 # apex_collector returns:
-                # - apex_data_collected: number of apex data items collected
-                value = job_results.get('apex_data_collected')
+                # - total_number_published_metrics: total metrics successfully written to VM
+                # - apex_data_collected: number of apex data items collected (legacy/auxiliary)
+                value = job_results.get('total_number_published_metrics')
+                if value is None:
+                    # Backwards compatibility with older result schema
+                    value = job_results.get('apex_data_collected')
                 if value is not None:
                     processed_metrics = int(value) if isinstance(value, (int, float)) else None
-                # failed_count: number of failed processing operations
+                # failed_count: number of failed processing operations (unchanged)
                 failed_value = job_results.get('failed_count')
                 if failed_value is not None:
                     failed_metrics = int(failed_value) if isinstance(failed_value, (int, float)) else None
@@ -381,21 +385,28 @@ class JobExecutor:
                     failed_metrics = int(failed_value) if isinstance(failed_value, (int, float)) else None
             
             elif job_type == 'metrics_forecast_notebooks':
-                # metrics_forecast_notebooks returns:
-                # - notebooks_executed: number of notebooks executed
-                # - notebooks_succeeded: number of successful executions
-                # We use notebooks_executed as processed_metrics
-                value = job_results.get('notebooks_executed')
+                # metrics_forecast_notebooks returns (when notebooks write results):
+                # - timeseries_processed: timeseries with successful forecast
+                # - timeseries_failed: timeseries skipped/failed
+                # Fallback: notebooks_executed, notebooks_failed
+                value = job_results.get('timeseries_processed')
                 if value is not None:
                     processed_metrics = int(value) if isinstance(value, (int, float)) else None
-                # notebooks_failed: number of failed notebook executions
-                failed_value = job_results.get('notebooks_failed')
+                if processed_metrics is None:
+                    value = job_results.get('notebooks_executed')
+                    if value is not None:
+                        processed_metrics = int(value) if isinstance(value, (int, float)) else None
+                failed_value = job_results.get('timeseries_failed')
                 if failed_value is not None:
                     failed_metrics = int(failed_value) if isinstance(failed_value, (int, float)) else None
+                if failed_metrics is None:
+                    failed_value = job_results.get('notebooks_failed')
+                    if failed_value is not None:
+                        failed_metrics = int(failed_value) if isinstance(failed_value, (int, float)) else None
             
             else:
                 # Unknown job type, try common field names in order of preference
-                for field in ['number_of_processed_metrics', 'metrics_saved_count', 'series_processed', 'processed_count', 'apex_data_collected', 'processed_entries', 'metrics_converted', 'notebooks_executed']:
+                for field in ['number_of_processed_metrics', 'total_number_published_metrics', 'metrics_saved_count', 'series_processed', 'timeseries_processed', 'processed_count', 'apex_data_collected', 'processed_entries', 'metrics_converted', 'notebooks_executed']:
                     if field in job_results:
                         value = job_results.get(field)
                         if value is not None:
@@ -403,7 +414,7 @@ class JobExecutor:
                             break
                 
                 # Try to find failed metrics
-                for field in ['number_of_failed_metrics', 'failed_count', 'failed_series', 'notebooks_failed']:
+                for field in ['number_of_failed_metrics', 'failed_count', 'failed_series', 'timeseries_failed', 'notebooks_failed']:
                     if field in job_results:
                         failed_value = job_results.get(field)
                         if failed_value is not None:
