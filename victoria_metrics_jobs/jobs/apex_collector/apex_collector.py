@@ -60,7 +60,7 @@ class ApexCollectorState(BaseJobState):
         apex_count = len(self.apex_data) if self.apex_data else 0
         results.update({
             'apex_data_collected': apex_count,
-            'processed_count': self.processed_count,
+            'total_number_published_metrics': self.processed_count,
             'failed_count': self.failed_count,
             'success_rate': self.processed_count / max(len(self.weekdays_to_update) if self.weekdays_to_update else 1, 1) * 100,
             'weekdays_processed': len(self.weekdays) if self.weekdays else 0,
