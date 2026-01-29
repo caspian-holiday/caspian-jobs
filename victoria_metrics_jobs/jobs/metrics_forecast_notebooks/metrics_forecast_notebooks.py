@@ -42,8 +42,8 @@ class MetricsForecastNotebooksState(BaseJobState):
     vm_query_url: str = ""
     vm_token: str = ""
     db_connection_string: str = ""
-    papermill_start_timeout: int = 300  # Timeout for kernel startup (seconds)
-    papermill_execution_timeout: Optional[int] = None  # Timeout for cell execution (None = no timeout)
+    papermill_start_timeout: float = 300.0  # Timeout for kernel startup (seconds); papermill/nbclient expect float
+    papermill_execution_timeout: Optional[float] = None  # Timeout for cell execution (None = no timeout); papermill expects float
 
     def to_results(self) -> Dict[str, Any]:
         """Extend base results with notebook execution metadata."""
@@ -92,11 +92,13 @@ class MetricsForecastNotebooksJob(BaseJob):
             )
             notebooks_output_dir_path = Path(notebooks_output_dir)
             
-            # Get timeout settings for papermill execution
+            # Get timeout settings for papermill execution (must be float per papermill/nbclient API)
             # start_timeout: time to wait for kernel to start (default: 60s, increase for slow systems)
             # execution_timeout: time to wait for each cell execution (default: None = no timeout)
-            papermill_start_timeout = job_config.get("papermill_start_timeout", 300)  # 5 minutes default
-            papermill_execution_timeout = job_config.get("papermill_execution_timeout", None)  # No timeout by default
+            _start = job_config.get("papermill_start_timeout", 300)
+            _exec = job_config.get("papermill_execution_timeout", None)
+            papermill_start_timeout = float(_start) if _start is not None else 300.0
+            papermill_execution_timeout = float(_exec) if _exec is not None else None
 
             # Get Victoria Metrics and database config for notebook parameters
             victoria_metrics_cfg = job_config.get("victoria_metrics", {})
@@ -389,7 +391,7 @@ class MetricsForecastNotebooksJob(BaseJob):
                     # Suppress papermill parameter warnings if they occur
                     warnings.filterwarnings('ignore', message='.*unknown.*parameter.*', category=UserWarning)
                     
-                    # Prepare execute_notebook arguments
+                    # Prepare execute_notebook arguments (timeouts must be float per papermill/nbclient API)
                     execute_kwargs = {
                         'input_path': str(input_path),
                         'output_path': str(output_path),
@@ -398,12 +400,12 @@ class MetricsForecastNotebooksJob(BaseJob):
                         'log_output': True,
                         'stdout_file': None,  # Don't capture stdout
                         'stderr_file': None,  # Don't capture stderr
-                        'start_timeout': state.papermill_start_timeout,  # Timeout for kernel startup
+                        'start_timeout': float(state.papermill_start_timeout),  # Timeout for kernel startup (seconds)
                     }
                     
                     # Add execution_timeout only if specified (None means no timeout)
                     if state.papermill_execution_timeout is not None:
-                        execute_kwargs['execution_timeout'] = state.papermill_execution_timeout
+                        execute_kwargs['execution_timeout'] = float(state.papermill_execution_timeout)
                     
                     self.logger.info(
                         f"Executing notebook with start_timeout={state.papermill_start_timeout}s, "
