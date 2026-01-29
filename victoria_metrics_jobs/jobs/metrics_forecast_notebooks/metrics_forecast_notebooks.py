@@ -44,6 +44,7 @@ class MetricsForecastNotebooksState(BaseJobState):
     db_connection_string: str = ""
     papermill_start_timeout: int = 300  # Timeout for kernel startup (seconds); nbclient Integer trait expects int
     papermill_execution_timeout: Optional[int] = None  # Timeout for cell execution (None = no timeout); nbclient Integer trait expects int
+    config_path: str = ""  # Path to YAML config file; passed to notebook so it can call create_database_connection(..., config_path=...)
 
     def to_results(self) -> Dict[str, Any]:
         """Extend base results with notebook execution metadata."""
@@ -104,6 +105,9 @@ class MetricsForecastNotebooksJob(BaseJob):
             victoria_metrics_cfg = job_config.get("victoria_metrics", {})
             database_cfg = job_config.get("database") or job_config.get("forecast_database", {})
             
+            # Config path used to load this job (scheduler passes --config); notebook uses it for create_database_connection
+            config_path = getattr(self, "config_path", None) or ""
+
             state = MetricsForecastNotebooksState(
                 job_id=job_id,
                 job_config=job_config,
@@ -115,6 +119,7 @@ class MetricsForecastNotebooksJob(BaseJob):
                 db_connection_string=self._build_database_connection_string(database_cfg) if database_cfg else "",
                 papermill_start_timeout=papermill_start_timeout,
                 papermill_execution_timeout=papermill_execution_timeout,
+                config_path=config_path or "",
             )
 
             self.logger.info(
@@ -368,10 +373,12 @@ class MetricsForecastNotebooksJob(BaseJob):
             # Prepare parameters to inject into notebook
             # Note: All parameters defined in the notebook's parameters cell must be passed
             # to avoid papermill warnings about unknown parameters
+            # vm_jobs_config_path: passed so notebook can call create_database_connection(..., config_path=...)
             notebook_parameters = {
                 "vm_query_url": state.vm_query_url,
                 "vm_token": state.vm_token,
                 "vm_jobs_environment": environment,
+                "vm_jobs_config_path": state.config_path or "",
                 "dry_run": False,  # Default to False for production runs
                 "output_results_path": str(output_results_path) if output_results_path else "",
             }

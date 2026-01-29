@@ -144,6 +144,7 @@ class BaseJob(ABC):
             verbose: Whether to enable verbose logging
         """
         self.job_name = job_name
+        self.config_path = config_path  # Path to YAML config (e.g. for passing to notebooks when run as service)
         self.logger = setup_job_logging(job_name, verbose)
         self.config_manager = JobConfigManager(job_name, self.logger)
         self._db_manager = None  # Lazy initialization
@@ -158,6 +159,7 @@ class BaseJob(ABC):
         Args:
             config_path: Path to YAML configuration file
         """
+        self.config_path = config_path
         self.config_manager.load_config(config_path)
     
     def get_job_config(self, job_id: str) -> Dict[str, Any]:
