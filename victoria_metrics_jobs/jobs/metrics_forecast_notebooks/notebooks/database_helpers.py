@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from urllib.parse import quote_plus
 
 import numpy as np
@@ -45,6 +45,19 @@ if _project_root and str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from victoria_metrics_jobs.scheduler.config import ConfigLoader
+
+
+def _json_serializer(obj: Any) -> Any:
+    """Convert date/datetime and other non-JSON types for json.dumps."""
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    if isinstance(obj, (np.integer, np.floating)):
+        return float(obj) if isinstance(obj, np.floating) else int(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 def load_database_config_from_yaml(
@@ -457,8 +470,8 @@ def create_forecast_run_record(
         
         # For Prophet, use the existing prophet_config field
         # For other models, we'll also use prophet_config but include model_type
-        prophet_config_json = json.dumps(config_json) if model_type == "prophet" else json.dumps(config_json)
-        prophet_fit_config_json = json.dumps(model_fit_config) if model_fit_config else None
+        prophet_config_json = json.dumps(config_json, default=_json_serializer)
+        prophet_fit_config_json = json.dumps(model_fit_config, default=_json_serializer) if model_fit_config else None
         
         insert_sql = text("""
             INSERT INTO public.vm_forecast_job (
