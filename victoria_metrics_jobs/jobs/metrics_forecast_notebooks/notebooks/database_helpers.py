@@ -60,6 +60,16 @@ def _json_serializer(obj: Any) -> Any:
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
+def _json_serializer_for_metadata(obj: Any) -> Any:
+    """JSON serializer for forecast metadata; handles NaN/inf and uses _json_serializer for rest."""
+    try:
+        if isinstance(obj, (float, np.floating)) and (np.isnan(obj) or np.isinf(obj)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return _json_serializer(obj)
+
+
 def load_database_config_from_yaml(
     config_path: Optional[str] = None,
     environment: Optional[str] = None
@@ -530,6 +540,133 @@ def create_forecast_run_record(
         if conn:
             conn.rollback()
         raise RuntimeError(f"Failed to create forecast run record: {exc}") from exc
+
+
+def update_forecast_run_record(
+    conn: Any,
+    run_id: int,
+    series_count: Optional[int] = None,
+    success_count: Optional[int] = None,
+    failed_count: Optional[int] = None,
+    status: Optional[str] = None,
+    completed_at: Optional[datetime] = None,
+    duration_seconds: Optional[float] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    """Update a forecast run record with counts and completion status."""
+    try:
+        updates = []
+        params = {"run_id": run_id}
+        if series_count is not None:
+            updates.append("series_count = :series_count")
+            params["series_count"] = series_count
+        if success_count is not None:
+            updates.append("success_count = :success_count")
+            params["success_count"] = success_count
+        if failed_count is not None:
+            updates.append("failed_count = :failed_count")
+            params["failed_count"] = failed_count
+        if status is not None:
+            updates.append("status = :status")
+            params["status"] = status
+        if completed_at is not None:
+            updates.append("completed_at = :completed_at")
+            params["completed_at"] = completed_at
+        if duration_seconds is not None:
+            updates.append("duration_seconds = :duration_seconds")
+            params["duration_seconds"] = duration_seconds
+        if error_message is not None:
+            updates.append("error_message = :error_message")
+            params["error_message"] = error_message
+        if not updates:
+            return
+        update_sql = text(
+            "UPDATE public.vm_forecast_job SET " + ", ".join(updates) + " WHERE run_id = :run_id"
+        )
+        conn.execute(update_sql, params)
+        conn.commit()
+    except SQLAlchemyError as exc:
+        if conn:
+            conn.rollback()
+        raise RuntimeError(f"Database error updating forecast run record: {exc}") from exc
+
+
+def save_forecast_metadata_for_metric(
+    conn: Any,
+    run_id: int,
+    job_id: str,
+    metric_name: str,
+    metric_labels: Dict[str, str],
+    tsfel_features: Dict[str, Any],
+    classification: Dict[str, str],
+    prophet_params: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Insert or update one row in vm_metrics_forecast_metadata for a metric in a run.
+
+    Resolves the source metric (job_idx, metric_id) via find_or_get_metric_id,
+    then upserts a row with metadata JSON containing tsfel_features,
+    classification (category, reason), and prophet_params (or null).
+
+    Args:
+        conn: Database connection
+        run_id: Forecast run id from vm_forecast_job
+        job_id: Source job id (e.g. labels["job"], e.g. "extractor")
+        metric_name: Metric name
+        metric_labels: Metric labels (will be normalized for lookup)
+        tsfel_features: Dict of TSFEL/stat features (serializable)
+        classification: Dict with "category" and "reason" keys
+        prophet_params: Prophet parameters for this metric, or None when Not Suitable
+    """
+    try:
+        job_idx = find_or_get_job_idx(conn, job_id)
+        job_idx, metric_id = find_or_get_metric_id(
+            conn,
+            job_idx,
+            job_id,
+            metric_name,
+            metric_labels,
+        )
+        if job_idx is None or metric_id is None:
+            raise RuntimeError(
+                f"Failed to resolve (job_idx, metric_id) for job_id='{job_id}', metric_name='{metric_name}'"
+            )
+
+        metadata_payload = {
+            "tsfel_features": tsfel_features,
+            "classification": classification,
+            "prophet_params": prophet_params,
+        }
+        metadata_json = json.dumps(metadata_payload, default=_json_serializer_for_metadata)
+
+        upsert_sql = text("""
+            INSERT INTO public.vm_metrics_forecast_metadata (
+                job_idx, metric_id, run_id, metadata
+            )
+            VALUES (
+                :job_idx, :metric_id, :run_id, CAST(:metadata AS jsonb)
+            )
+            ON CONFLICT (job_idx, metric_id, run_id)
+            DO UPDATE SET metadata = EXCLUDED.metadata
+        """)
+        conn.execute(upsert_sql, {
+            "job_idx": job_idx,
+            "metric_id": metric_id,
+            "run_id": run_id,
+            "metadata": metadata_json,
+        })
+        conn.commit()
+    except SQLAlchemyError as exc:
+        if conn:
+            conn.rollback()
+        raise RuntimeError(
+            f"Database error saving forecast metadata for {metric_name}: {exc}"
+        ) from exc
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+        raise RuntimeError(
+            f"Failed to save forecast metadata for {metric_name}: {exc}"
+        ) from exc
 
 
 def save_forecasts_to_database(
