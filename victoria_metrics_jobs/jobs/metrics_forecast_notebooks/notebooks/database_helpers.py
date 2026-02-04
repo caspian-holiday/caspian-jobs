@@ -607,24 +607,33 @@ def save_forecast_metadata_for_metric(
     then upserts a row with metadata JSON containing tsfel_features,
     classification (category, reason), and prophet_params (or null).
 
+    Uses the same metric_labels convention as the extractor: "job" is stored
+    in the job_id column, not in metric_labels, so we exclude it before lookup
+    to resolve the same (job_idx, metric_id) as the extractor would.
+
     Args:
         conn: Database connection
         run_id: Forecast run id from vm_forecast_job
         job_id: Source job id (e.g. labels["job"], e.g. "extractor")
         metric_name: Metric name
-        metric_labels: Metric labels (will be normalized for lookup)
+        metric_labels: Metric labels from the series (will be normalized for lookup)
         tsfel_features: Dict of TSFEL/stat features (serializable)
         classification: Dict with "category" and "reason" keys
         prophet_params: Prophet parameters for this metric, or None when Not Suitable
     """
     try:
+        # Match extractor convention: job is stored in job_id column, not in metric_labels.
+        # Excluding "job" ensures we resolve the same (job_idx, metric_id) as the
+        # extractor, avoiding duplicate source metrics in vm_metric_metadata.
+        source_metric_labels = {k: v for k, v in metric_labels.items() if k != "job"}
+
         job_idx = find_or_get_job_idx(conn, job_id)
         job_idx, metric_id = find_or_get_metric_id(
             conn,
             job_idx,
             job_id,
             metric_name,
-            metric_labels,
+            source_metric_labels,
         )
         if job_idx is None or metric_id is None:
             raise RuntimeError(
