@@ -13,6 +13,8 @@
 -- Purpose: Stores per-metric, per-run TSFEL features, predictability
 --          classification, and Prophet parameters used for forecasting.
 --          Enables auditing, reproducibility, and analysis of classification.
+-- (job_idx, metric_id) references the forecast metric in vm_metric_metadata
+-- (same job_idx, metric_id used when writing forecast points to vm_metric_data).
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS vm_metrics_forecast_metadata (
     job_idx BIGINT NOT NULL,

@@ -542,6 +542,19 @@ def create_forecast_run_record(
         raise RuntimeError(f"Failed to create forecast run record: {exc}") from exc
 
 
+def check_forecast_metadata_table_exists(conn: Any) -> bool:
+    """Return True if public.vm_metrics_forecast_metadata table exists."""
+    try:
+        result = conn.execute(text("""
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = 'vm_metrics_forecast_metadata'
+            LIMIT 1
+        """))
+        return result.fetchone() is not None
+    except Exception:
+        return False
+
+
 def update_forecast_run_record(
     conn: Any,
     run_id: int,
@@ -678,6 +691,70 @@ def save_forecast_metadata_for_metric(
         ) from exc
 
 
+def save_forecast_metadata_for_metric_by_id(
+    conn: Any,
+    run_id: int,
+    job_idx: int,
+    metric_id: int,
+    tsfel_features: Dict[str, Any],
+    classification: Dict[str, str],
+    prophet_params: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Insert or update one row in vm_metrics_forecast_metadata using known (job_idx, metric_id).
+
+    Use this when (job_idx, metric_id) were already resolved (e.g. from
+    save_forecasts_to_database) so no lookup is needed. The (job_idx, metric_id)
+    must reference the forecast metric row in vm_metric_metadata (same as used
+    for vm_metric_data forecast points).
+
+    Args:
+        conn: Database connection
+        run_id: Forecast run id from vm_forecast_job
+        job_idx: job_idx from vm_metric_metadata (forecast metric)
+        metric_id: metric_id from vm_metric_metadata (forecast metric)
+        tsfel_features: Dict of TSFEL/stat features (serializable)
+        classification: Dict with "category" and "reason" keys
+        prophet_params: Prophet parameters for this metric, or None when Not Suitable
+    """
+    try:
+        metadata_payload = {
+            "tsfel_features": tsfel_features,
+            "classification": classification,
+            "prophet_params": prophet_params,
+        }
+        metadata_json = json.dumps(metadata_payload, default=_json_serializer_for_metadata)
+
+        upsert_sql = text("""
+            INSERT INTO public.vm_metrics_forecast_metadata (
+                job_idx, metric_id, run_id, metadata
+            )
+            VALUES (
+                :job_idx, :metric_id, :run_id, CAST(:metadata AS jsonb)
+            )
+            ON CONFLICT (job_idx, metric_id, run_id)
+            DO UPDATE SET metadata = EXCLUDED.metadata
+        """)
+        conn.execute(upsert_sql, {
+            "job_idx": job_idx,
+            "metric_id": metric_id,
+            "run_id": run_id,
+            "metadata": metadata_json,
+        })
+        conn.commit()
+    except SQLAlchemyError as exc:
+        if conn:
+            conn.rollback()
+        raise RuntimeError(
+            f"Database error saving forecast metadata (job_idx={job_idx}, metric_id={metric_id}): {exc}"
+        ) from exc
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+        raise RuntimeError(
+            f"Failed to save forecast metadata (job_idx={job_idx}, metric_id={metric_id}): {exc}"
+        ) from exc
+
+
 def save_forecasts_to_database(
     conn: Any,
     metric_name: str,
@@ -685,7 +762,7 @@ def save_forecasts_to_database(
     forecast_df: pd.DataFrame,
     forecast_types: List[Dict[str, str]],
     run_id: Optional[int] = None,
-) -> int:
+) -> Tuple[int, Optional[int], Optional[int]]:
     """Write forecast data to database (vm_metric_data and vm_metric_metadata).
     
     This function:
@@ -706,8 +783,11 @@ def save_forecasts_to_database(
         run_id: Optional run_id from vm_forecast_job table for parameter tracking
         
     Returns:
-        Number of forecast rows written
-        
+        Tuple of (rows_written, job_idx, metric_id) for the first forecast type
+        (e.g. "trend"), so the caller can use (job_idx, metric_id) for
+        vm_metrics_forecast_metadata without looking up again.
+        If no rows written, returns (0, None, None).
+
     Raises:
         ValueError: If 'job' label is missing from labels
     """
@@ -758,7 +838,11 @@ def save_forecasts_to_database(
             forecast_type_metric_ids[name] = metric_id
         
         if not forecast_type_metric_ids:
-            return 0
+            return (0, None, None)
+
+        # job_idx and first forecast_type's metric_id for caller (e.g. vm_metrics_forecast_metadata)
+        first_type_name = forecast_types[0]["name"] if forecast_types else None
+        metric_id_primary = forecast_type_metric_ids.get(first_type_name) if first_type_name else next(iter(forecast_type_metric_ids.values()), None)
         
         # STEP 2: Ensure all metadata entries are committed before inserting data
         conn.commit()
@@ -800,7 +884,7 @@ def save_forecasts_to_database(
                 })
         
         if not rows_to_insert:
-            return 0
+            return (0, job_idx, metric_id_primary)
         
         # Build PostgreSQL upsert statement for vm_metric_data
         # ON CONFLICT ... DO UPDATE for idempotent writes
@@ -823,7 +907,7 @@ def save_forecasts_to_database(
         
         conn.commit()
         
-        return len(rows_to_insert)
+        return (len(rows_to_insert), job_idx, metric_id_primary)
         
     except SQLAlchemyError as exc:
         if conn:
