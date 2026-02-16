@@ -1,0 +1,3 @@
+# Empty configuration - no jobs
+max_workers: 10
+jobs: []

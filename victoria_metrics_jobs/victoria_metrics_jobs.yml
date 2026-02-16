@@ -1,0 +1,563 @@
+# Victoria Metrics Jobs Scheduler Configuration
+# Single consolidated configuration file using OmegaConf interpolation
+# Environment selection: Set VM_JOBS_ENVIRONMENT variable to local or dev
+
+# Environment-specific configurations
+environments:
+  local:
+    # Global scheduler settings for local development
+    max_workers: ${oc.env:VM_JOBS_SCHEDULER_MAX_WORKERS,2}
+    
+    # Database settings for job locking (optional for local)
+    database:
+      host: ${oc.env:VM_JOBS_DB_HOST,localhost}
+      port: ${oc.env:VM_JOBS_DB_PORT,5432}
+      name: ${oc.env:VM_JOBS_DB_NAME,scheduler_local}
+      user: ${oc.env:VM_JOBS_DB_USER,scheduler}
+      password: ${oc.env:VM_JOBS_DB_PASSWORD,local_password}
+      ssl_mode: ${oc.env:VM_JOBS_DB_SSL_MODE,prefer}
+      connection_timeout: ${oc.env:VM_JOBS_DB_CONNECTION_TIMEOUT,10}
+    
+    # Victoria Metrics settings for all jobs
+    victoria_metrics:
+      gateway_url: ${oc.env:VM_JOBS_VM_GATEWAY_URL,http://localhost:8428/api/v1/write}
+      query_url: ${oc.env:VM_JOBS_VM_QUERY_URL,http://localhost:8428}
+      token: ${oc.env:VM_JOBS_VM_TOKEN,}
+      timeout: ${oc.env:VM_JOBS_VM_TIMEOUT,30}
+      retry_attempts: ${oc.env:VM_JOBS_VM_RETRY_ATTEMPTS,3}
+      retry_delay: ${oc.env:VM_JOBS_VM_RETRY_DELAY,1}
+    
+    # Prometheus metrics server settings
+    metrics:
+      directory: ${oc.env:VM_JOBS_METRICS_DIRECTORY,/var/lib/scheduler/metrics}
+      archive_directory: ${oc.env:VM_JOBS_METRICS_ARCHIVE_DIRECTORY,/var/lib/scheduler/metrics_archive}
+      enable_archive: ${oc.env:VM_JOBS_METRICS_ENABLE_ARCHIVE,true}
+      port: ${oc.env:VM_JOBS_METRICS_PORT,8000}
+      host: ${oc.env:VM_JOBS_METRICS_HOST,0.0.0.0}
+      retention_days: ${oc.env:VM_JOBS_METRICS_RETENTION_DAYS,14}
+    
+    # Common configuration for job types
+    common:
+      extractor:
+        # Default values for extractor jobs
+        default_chunk_size_days: 1
+        default_offset_days: 0
+      
+    
+    # Consolidated job definitions
+    jobs:
+      metrics_cleanup:
+        # Scheduler attributes (read by scheduler config loader)
+        id: metrics_cleanup
+        name: Metrics File Cleanup
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.metrics_cleanup", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_cleanup"]
+        schedule:
+          type: cron
+          args:
+            hour: 2
+            minute: 0
+        
+        # Job-specific attributes (read by job config loader)
+        job_type: metrics_cleanup
+        # Metrics configuration is automatically added from environment.metrics section
+        notebooks_job_id: metrics_forecast_notebooks  # Job ID to get notebooks settings from
+      
+      system_a_extractor:
+        # Scheduler attributes (read by scheduler config loader)
+        id: system_a_extractor
+        name: System A Data Extraction (Local)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.extractor", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "system_a_extractor"]
+        schedule:
+          type: cron
+          args:
+            hour: 2
+            minute: 0
+        
+        # Job-specific attributes (read by job config loader)
+        job_type: extractor
+        # Database configuration (interpolated directly from environment)
+        database: ${environments.local.database}
+        # Victoria Metrics configuration (source system)
+        source_url: ${environments.local.victoria_metrics.query_url}
+        # Use defaults
+        start_date_offset_days: ${oc.env:VM_JOBS_SYSTEM_A_START_OFFSET,${environments.local.common.extractor.default_offset_days}}
+        chunk_size_days: ${oc.env:VM_JOBS_SYSTEM_A_CHUNK_SIZE,${environments.local.common.extractor.default_chunk_size_days}}
+
+      apex_collector:
+        # Scheduler attributes
+        id: apex_collector
+        name: Apex Number Collection (Local)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.apex_collector", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "apex_collector"]
+        schedule:
+          type: cron
+          args:
+            hour: 1
+            minute: 0
+        
+        # Job-specific attributes
+        job_type: apex_collector
+        # Database configuration (interpolated directly from environment)
+        database: ${environments.local.database}
+        # Job-specific source
+        source_url: ${oc.env:VM_JOBS_APEX_SOURCE_URL,http://localhost:3002/api/apex}
+        source_token: ${oc.env:VM_JOBS_APEX_SOURCE_TOKEN,local_source_token}
+        # Victoria Metrics configuration (target system)
+        victoria_metrics: ${environments.local.victoria_metrics}
+        # APEX-specific settings
+        max_days_per_run: ${oc.env:VM_JOBS_APEX_MAX_DAYS,5}
+        sliding_window_days: ${oc.env:VM_JOBS_APEX_SLIDING_WINDOW,0}
+        business_date_cutoff_hour: ${oc.env:VM_JOBS_APEX_CUTOFF_HOUR,6}
+
+      apex_extractor:
+        # Scheduler attributes
+        id: apex_extractor
+        name: Apex Data Extraction (Local)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.extractor", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "apex_extractor"]
+        schedule:
+          type: cron
+          args:
+            hour: 3
+            minute: 0
+        
+        # Job-specific attributes
+        job_type: extractor
+        # Database configuration (interpolated directly from environment)
+        database: ${environments.local.database}
+        # Victoria Metrics configuration (source system)
+        source_url: ${environments.local.victoria_metrics.query_url}
+        # Extractor-specific settings
+        start_date_offset_days: ${oc.env:VM_JOBS_APEX_EXTRACTOR_OFFSET,0}
+        chunk_size_days: ${oc.env:VM_JOBS_APEX_EXTRACTOR_CHUNK,1}
+        business_date_cutoff_hour: ${oc.env:VM_JOBS_APEX_CUTOFF_HOUR,6}
+
+      business_date_converter:
+        # Scheduler attributes
+        id: business_date_converter
+        name: Business Date Converter (Local)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.business_date_converter", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "business_date_converter"]
+        schedule:
+          type: cron
+          args:
+            hour: 6
+            minute: 0
+        
+        # Job-specific attributes
+        job_type: business_date_converter
+        # Victoria Metrics configuration
+        victoria_metrics: ${environments.local.victoria_metrics}
+        # Converter-specific settings
+        metric_selectors:
+          - '{job="apex_collector"}'
+        cutoff_hour: ${oc.env:VM_JOBS_BUSINESS_DATE_CONVERTER_CUTOFF_HOUR,6}
+        watermark_lookback_days: ${oc.env:VM_JOBS_BUSINESS_DATE_CONVERTER_LOOKBACK_DAYS,30}
+
+      metrics_forecast:
+        # Scheduler attributes
+        id: metrics_forecast
+        name: Metrics Forecast (Local)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.metrics_forecast", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_forecast"]
+        schedule:
+          type: cron
+          args:
+            hour: 7
+            minute: 0
+
+        # Job-specific attributes
+        job_type: metrics_forecast
+        victoria_metrics: ${environments.local.victoria_metrics}
+        # Database configuration for forecast storage
+        # Optional: if not specified, uses common database config
+        # Uncomment and configure to use a separate database for forecasts
+        # forecast_database:
+        #   host: ${oc.env:VM_JOBS_FORECAST_DB_HOST,localhost}
+        #   port: ${oc.env:VM_JOBS_FORECAST_DB_PORT,5432}
+        #   name: ${oc.env:VM_JOBS_FORECAST_DB_NAME,forecasts_db}
+        #   user: ${oc.env:VM_JOBS_FORECAST_DB_USER,forecast_user}
+        #   password: ${oc.env:VM_JOBS_FORECAST_DB_PASSWORD,}
+        #   ssl_mode: ${oc.env:VM_JOBS_FORECAST_DB_SSL_MODE,prefer}
+        #   connection_timeout: ${oc.env:VM_JOBS_FORECAST_DB_CONNECTION_TIMEOUT,10}
+        # If forecast_database is not specified, fallback to common database
+        database: ${environments.local.database}
+        # Legacy fields (no longer used as primary config - now database-driven)
+        # History and Prophet configuration is now stored in vm_forecast_config table
+        # source_job_names:
+        #   - apex_collector
+        # source_label: source
+        # metric_selectors:
+        #   - "{}"
+        # history_days: 365
+        # history_offset_days: 0
+        # history_step_hours: 24
+        # forecast_horizon_days: 20
+        # min_history_points: 30
+        # cutoff_hour: 6
+        forecast_types:
+          - name: trend
+            field: yhat
+          - name: lower
+            field: yhat_lower
+          - name: upper
+            field: yhat_upper
+        # Prophet configuration is now stored in vm_forecast_config table per selector
+        # prophet:
+        #   weekly_seasonality: false
+        #   daily_seasonality: false
+        #   yearly_seasonality: true
+        #   seasonality_mode: additive
+        labels:
+          env: local
+
+      metrics_extract:
+        # Scheduler attributes
+        id: metrics_extract
+        name: Metrics Extract (Local)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.metrics_extract", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_extract"]
+        schedule:
+          type: cron
+          args:
+            hour: 8
+            minute: 0
+
+        # Job-specific attributes
+        job_type: metrics_extract
+        victoria_metrics: ${environments.local.victoria_metrics}
+        # Database configuration for metric storage
+        # Optional: if not specified, uses common database config
+        # Uncomment and configure to use a separate database for extracted metrics
+        # extract_database:
+        #   host: ${oc.env:VM_JOBS_EXTRACT_DB_HOST,localhost}
+        #   port: ${oc.env:VM_JOBS_EXTRACT_DB_PORT,5432}
+        #   name: ${oc.env:VM_JOBS_EXTRACT_DB_NAME,metrics_db}
+        #   user: ${oc.env:VM_JOBS_EXTRACT_DB_USER,metrics_user}
+        #   password: ${oc.env:VM_JOBS_EXTRACT_DB_PASSWORD,}
+        #   ssl_mode: ${oc.env:VM_JOBS_EXTRACT_DB_SSL_MODE,prefer}
+        #   connection_timeout: ${oc.env:VM_JOBS_EXTRACT_DB_CONNECTION_TIMEOUT,10}
+        # If extract_database is not specified, fallback to common database
+        database: ${environments.local.database}
+        # Metric selectors - list of PromQL selectors to extract
+        metric_selectors:
+          - '{job="api"}'
+          - '{job="worker", env="prod"}'
+        # Initial lookback days when no previous extraction exists (default: 30)
+        initial_lookback_days: ${oc.env:VM_JOBS_EXTRACT_LOOKBACK_DAYS,30}
+        # Business date cutoff hour (default: 6)
+        cutoff_hour: ${oc.env:VM_JOBS_EXTRACT_CUTOFF_HOUR,6}
+        labels:
+          env: local
+
+      metrics_forecast_notebooks:
+        # Scheduler attributes
+        id: metrics_forecast_notebooks
+        name: Metrics Forecast Notebooks (Local)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.metrics_forecast_notebooks", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_forecast_notebooks"]
+        schedule:
+          type: cron
+          args:
+            hour: 8
+            minute: 30
+
+        # Job-specific attributes
+        job_type: metrics_forecast_notebooks
+        victoria_metrics: ${environments.local.victoria_metrics}
+        database: ${environments.local.database}
+        notebooks_directory: "notebooks"  # Input: source notebooks to execute (relative to job directory)
+        notebooks_output_directory: ${oc.env:VM_JOBS_NOTEBOOKS_OUTPUT_DIR,/var/lib/scheduler/notebooks_output}
+        notebooks_retention_days: ${oc.env:VM_JOBS_NOTEBOOKS_RETENTION_DAYS,${environments.local.metrics.retention_days}}
+        cutoff_hour: ${oc.env:VM_JOBS_CUTOFF_HOUR,6}
+        labels:
+          env: local
+
+  dev:
+    # Global scheduler settings
+    max_workers: ${oc.env:VM_JOBS_SCHEDULER_MAX_WORKERS,5}
+    
+    # Database settings for job locking
+    database:
+      host: ${oc.env:VM_JOBS_DB_HOST,localhost}
+      port: ${oc.env:VM_JOBS_DB_PORT,5432}
+      name: ${oc.env:VM_JOBS_DB_NAME,scheduler_dev}
+      user: ${oc.env:VM_JOBS_DB_USER,scheduler}
+      password: ${env_required:VM_JOBS_DB_PASSWORD,Database password is required}
+      ssl_mode: ${oc.env:VM_JOBS_DB_SSL_MODE,prefer}
+      connection_timeout: ${oc.env:VM_JOBS_DB_CONNECTION_TIMEOUT,10}
+    
+    # Victoria Metrics settings for all jobs
+    victoria_metrics:
+      gateway_url: ${env_required:VM_JOBS_VM_GATEWAY_URL,Victoria Metrics Gateway URL is required}
+      query_url: ${env_required:VM_JOBS_VM_QUERY_URL,Victoria Metrics Query URL is required}
+      token: ${oc.env:VM_JOBS_VM_TOKEN,}
+      timeout: ${oc.env:VM_JOBS_VM_TIMEOUT,30}
+      retry_attempts: ${oc.env:VM_JOBS_VM_RETRY_ATTEMPTS,3}
+      retry_delay: ${oc.env:VM_JOBS_VM_RETRY_DELAY,1}
+    
+    # Prometheus metrics server settings
+    metrics:
+      directory: ${oc.env:VM_JOBS_METRICS_DIRECTORY,/var/lib/scheduler/metrics}
+      archive_directory: ${oc.env:VM_JOBS_METRICS_ARCHIVE_DIRECTORY,/var/lib/scheduler/metrics_archive}
+      enable_archive: ${oc.env:VM_JOBS_METRICS_ENABLE_ARCHIVE,true}
+      port: ${oc.env:VM_JOBS_METRICS_PORT,8000}
+      host: ${oc.env:VM_JOBS_METRICS_HOST,0.0.0.0}
+      retention_days: ${oc.env:VM_JOBS_METRICS_RETENTION_DAYS,14}
+    
+    # Common configuration for job types
+    common:
+      extractor:
+        # Default values for extractor jobs
+        default_chunk_size_days: 7
+        default_offset_days: 0
+      
+    
+    # Consolidated job definitions
+    jobs:
+      metrics_cleanup:
+        # Scheduler attributes (read by scheduler config loader)
+        id: metrics_cleanup
+        name: Metrics File Cleanup
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.metrics_cleanup", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_cleanup"]
+        schedule:
+          type: cron
+          args:
+            hour: 2
+            minute: 0
+        
+        # Job-specific attributes (read by job config loader)
+        job_type: metrics_cleanup
+        # Metrics configuration is automatically added from environment.metrics section
+        notebooks_job_id: metrics_forecast_notebooks  # Job ID to get notebooks settings from
+      
+      system_a_extractor:
+        # Scheduler attributes (read by scheduler config loader)
+        id: system_a_extractor
+        name: System A Data Extraction (Dev)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.extractor", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "system_a_extractor"]
+        schedule:
+          type: cron
+          args:
+            hour: 2
+            minute: 0
+        
+        # Job-specific attributes (read by job config loader)
+        job_type: extractor
+        # Database configuration (interpolated directly from environment)
+        database: ${environments.dev.database}
+        # Victoria Metrics configuration (source system)
+        source_url: ${environments.dev.victoria_metrics.query_url}
+        # Use defaults
+        start_date_offset_days: ${oc.env:VM_JOBS_SYSTEM_A_START_OFFSET,${environments.dev.common.extractor.default_offset_days}}
+        chunk_size_days: ${oc.env:VM_JOBS_SYSTEM_A_CHUNK_SIZE,${environments.dev.common.extractor.default_chunk_size_days}}
+
+      apex_collector:
+        # Scheduler attributes
+        id: apex_collector
+        name: Apex Number Collection (Dev)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.apex_collector", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "apex_collector"]
+        schedule:
+          type: cron
+          args:
+            hour: 1
+            minute: 0
+        
+        # Job-specific attributes
+        job_type: apex_collector
+        # Database configuration (interpolated directly from environment)
+        database: ${environments.dev.database}
+        # Job-specific source
+        source_url: ${env_required:VM_JOBS_APEX_SOURCE_URL,Apex source URL is required}
+        source_token: ${env_required:VM_JOBS_APEX_SOURCE_TOKEN,Apex source token is required}
+        # Victoria Metrics configuration (target system)
+        victoria_metrics: ${environments.dev.victoria_metrics}
+        # APEX-specific settings
+        max_days_per_run: ${oc.env:VM_JOBS_APEX_MAX_DAYS,5}
+        sliding_window_days: ${oc.env:VM_JOBS_APEX_SLIDING_WINDOW,0}
+        business_date_cutoff_hour: ${oc.env:VM_JOBS_APEX_CUTOFF_HOUR,6}
+
+      apex_extractor:
+        # Scheduler attributes
+        id: apex_extractor
+        name: Apex Data Extraction (Dev)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.extractor", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "apex_extractor"]
+        schedule:
+          type: cron
+          args:
+            hour: 3
+            minute: 0
+        
+        # Job-specific attributes
+        job_type: extractor
+        # Database configuration (interpolated directly from environment)
+        database: ${environments.dev.database}
+        # Victoria Metrics configuration (source system)
+        source_url: ${environments.dev.victoria_metrics.query_url}
+        # Extractor-specific settings
+        start_date_offset_days: ${oc.env:VM_JOBS_APEX_EXTRACTOR_OFFSET,0}
+        chunk_size_days: ${oc.env:VM_JOBS_APEX_EXTRACTOR_CHUNK,7}
+        business_date_cutoff_hour: ${oc.env:VM_JOBS_APEX_CUTOFF_HOUR,6}
+
+      business_date_converter:
+        # Scheduler attributes
+        id: business_date_converter
+        name: Business Date Converter (Dev)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.business_date_converter", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "business_date_converter"]
+        schedule:
+          type: cron
+          args:
+            hour: 6
+            minute: 0
+        
+        # Job-specific attributes
+        job_type: business_date_converter
+        # Victoria Metrics configuration
+        victoria_metrics: ${environments.dev.victoria_metrics}
+        # Converter-specific settings
+        metric_selectors:
+          - '{job="apex_collector"}'
+        cutoff_hour: ${oc.env:VM_JOBS_BUSINESS_DATE_CONVERTER_CUTOFF_HOUR,6}
+        watermark_lookback_days: ${oc.env:VM_JOBS_BUSINESS_DATE_CONVERTER_LOOKBACK_DAYS,30}
+
+      metrics_forecast:
+        # Scheduler attributes
+        id: metrics_forecast
+        name: Metrics Forecast (Dev)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.metrics_forecast", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_forecast"]
+        schedule:
+          type: cron
+          args:
+            hour: 7
+            minute: 0
+
+        # Job-specific attributes
+        job_type: metrics_forecast
+        victoria_metrics: ${environments.dev.victoria_metrics}
+        # Database configuration for forecast storage
+        # Optional: if not specified, uses common database config
+        # Uncomment and configure to use a separate database for forecasts
+        # forecast_database:
+        #   host: ${oc.env:VM_JOBS_FORECAST_DB_HOST,localhost}
+        #   port: ${oc.env:VM_JOBS_FORECAST_DB_PORT,5432}
+        #   name: ${oc.env:VM_JOBS_FORECAST_DB_NAME,forecasts_db}
+        #   user: ${oc.env:VM_JOBS_FORECAST_DB_USER,forecast_user}
+        #   password: ${env_required:VM_JOBS_FORECAST_DB_PASSWORD,Forecast database password is required}
+        #   ssl_mode: ${oc.env:VM_JOBS_FORECAST_DB_SSL_MODE,require}
+        #   connection_timeout: ${oc.env:VM_JOBS_FORECAST_DB_CONNECTION_TIMEOUT,10}
+        # If forecast_database is not specified, fallback to common database
+        database: ${environments.dev.database}
+        # Legacy fields (no longer used as primary config - now database-driven)
+        # History and Prophet configuration is now stored in vm_forecast_config table
+        # source_job_names:
+        #   - apex_collector
+        # source_label: source
+        # metric_selectors:
+        #   - "{}"
+        # history_days: 365
+        # history_offset_days: 0
+        # history_step_hours: 24
+        # forecast_horizon_days: 20
+        # min_history_points: 30
+        # cutoff_hour: 6
+        forecast_types:
+          - name: trend
+            field: yhat
+          - name: lower
+            field: yhat_lower
+          - name: upper
+            field: yhat_upper
+        # Prophet configuration is now stored in vm_forecast_config table per selector
+        # prophet:
+        #   weekly_seasonality: false
+        #   daily_seasonality: false
+        #   yearly_seasonality: true
+        #   seasonality_mode: additive
+        labels:
+          env: dev
+
+      metrics_extract:
+        # Scheduler attributes
+        id: metrics_extract
+        name: Metrics Extract (Dev)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.metrics_extract", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_extract"]
+        schedule:
+          type: cron
+          args:
+            hour: 8
+            minute: 0
+
+        # Job-specific attributes
+        job_type: metrics_extract
+        victoria_metrics: ${environments.dev.victoria_metrics}
+        # Database configuration for metric storage
+        # Optional: if not specified, uses common database config
+        # Uncomment and configure to use a separate database for extracted metrics
+        # extract_database:
+        #   host: ${oc.env:VM_JOBS_EXTRACT_DB_HOST,localhost}
+        #   port: ${oc.env:VM_JOBS_EXTRACT_DB_PORT,5432}
+        #   name: ${oc.env:VM_JOBS_EXTRACT_DB_NAME,metrics_db}
+        #   user: ${oc.env:VM_JOBS_EXTRACT_DB_USER,metrics_user}
+        #   password: ${env_required:VM_JOBS_EXTRACT_DB_PASSWORD,Extract database password is required}
+        #   ssl_mode: ${oc.env:VM_JOBS_EXTRACT_DB_SSL_MODE,require}
+        #   connection_timeout: ${oc.env:VM_JOBS_EXTRACT_DB_CONNECTION_TIMEOUT,10}
+        # If extract_database is not specified, fallback to common database
+        database: ${environments.dev.database}
+        # Metric selectors - list of PromQL selectors to extract
+        metric_selectors:
+          - '{job="api"}'
+          - '{job="worker", env="prod"}'
+        # Initial lookback days when no previous extraction exists (default: 30)
+        initial_lookback_days: ${oc.env:VM_JOBS_EXTRACT_LOOKBACK_DAYS,30}
+        # Business date cutoff hour (default: 6)
+        cutoff_hour: ${oc.env:VM_JOBS_EXTRACT_CUTOFF_HOUR,6}
+        labels:
+          env: dev
+
+      metrics_forecast_notebooks:
+        # Scheduler attributes
+        id: metrics_forecast_notebooks
+        name: Metrics Forecast Notebooks (Dev)
+        enabled: true
+        script: "python"
+        args: ["-m", "victoria_metrics_jobs.jobs.metrics_forecast_notebooks", "--config", "victoria_metrics_jobs/victoria_metrics_jobs.yml", "--job-id", "metrics_forecast_notebooks"]
+        schedule:
+          type: cron
+          args:
+            hour: 8
+            minute: 30
+
+        # Job-specific attributes
+        job_type: metrics_forecast_notebooks
+        victoria_metrics: ${environments.dev.victoria_metrics}
+        database: ${environments.dev.database}
+        notebooks_directory: "notebooks"  # Input: source notebooks to execute (relative to job directory)
+        notebooks_output_directory: ${oc.env:VM_JOBS_NOTEBOOKS_OUTPUT_DIR,/var/lib/scheduler/notebooks_output}
+        notebooks_retention_days: ${oc.env:VM_JOBS_NOTEBOOKS_RETENTION_DAYS,${environments.dev.metrics.retention_days}}
+        cutoff_hour: ${oc.env:VM_JOBS_CUTOFF_HOUR,6}
+        labels:
+          env: dev

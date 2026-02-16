@@ -1,0 +1,40 @@
+[Unit]
+Description=Victoria Metrics Jobs Service
+Documentation=https://github.com/your-org/victoria_metrics_jobs
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=victoria_metrics_jobs
+Group=victoria_metrics_jobs
+WorkingDirectory=/opt/victoria_metrics_jobs
+ExecStart=/opt/victoria_metrics_jobs/.venv/bin/python -m victoria_metrics_jobs.victoria_metrics_jobs --config /etc/victoria_metrics_jobs/victoria_metrics_jobs.yml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=victoria_metrics_jobs
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/victoria_metrics_jobs /opt/victoria_metrics_jobs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=512M
+CPUQuota=50%
+
+# Environment
+Environment=PYTHONPATH=/opt/victoria_metrics_jobs
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
