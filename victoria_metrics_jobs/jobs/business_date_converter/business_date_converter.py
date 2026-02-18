@@ -5,6 +5,7 @@ Business Date Converter Job - Converts metrics with biz_date labels to timestamp
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
@@ -32,7 +33,7 @@ class BusinessDateConverterState(BaseJobState):
     - metrics_processed: Count of metrics processed
     - metrics_converted: Count of metrics successfully converted
     - failed_count: Count of failed conversions
-    - vm_query_url: URL to query VM
+    - vm_query_url: URL for VM (export and watermark reads)
     - vm_gateway_url: URL to write metrics to VM
     - vm_token: Authentication token for VM
     """
@@ -117,7 +118,7 @@ class BusinessDateConverterJob(BaseJob):
         return [
             self._derive_current_business_date,   # Step 1: Derive current business date
             self._read_job_watermarks,            # Step 2: Read job watermarks
-            self._query_and_convert_metrics,      # Step 3: Query updated metrics and convert
+            self._query_and_convert_metrics,      # Step 3: Export bd-aware metrics and convert
             self._update_job_watermarks,          # Step 4: Update job watermarks
             self._publish_job_status_metric       # Step 5: Publish job status metric
         ]
@@ -212,9 +213,9 @@ class BusinessDateConverterJob(BaseJob):
             self.logger.error(f"Failed to read job watermarks: {e}")
             return Err(e)
     
-    # Step 3: Query via API (last_over_time + timestamp) and convert with per-day watermark
+    # Step 3: Export bd-aware metrics and convert with per-day watermark
     def _query_and_convert_metrics(self, state: BusinessDateConverterState) -> Result[BusinessDateConverterState, Exception]:
-        """Query bd-aware metrics with query API (overlap window), filter by source watermark, allocate output ts with per-day watermark."""
+        """Fetch bd-aware metrics via single export call (overlap window), filter by source watermark, allocate output ts with per-day watermark."""
         try:
             if not state.vm_query_url:
                 self.logger.error("No VM query URL configured")
@@ -232,8 +233,10 @@ class BusinessDateConverterJob(BaseJob):
                         window_s = max(1, now_s - wm_s + overlap_s)
                     else:
                         window_s = initial_lookback_s
+                    start_s = now_s - window_s
+                    end_s = now_s
                     selector = f'{{job="{job}", biz_date!=""}}'
-                    to_write = self._query_series_to_convert(state, prom, selector, wm_ms, window_s)
+                    to_write = self._query_series_to_convert(state, prom, selector, wm_ms, start_s, end_s)
                     self.logger.info(f"Job {job}: {len(to_write)} series after watermark filter")
                     if not to_write:
                         state.max_processed_timestamps.pop(job, None)
@@ -295,64 +298,59 @@ class BusinessDateConverterJob(BaseJob):
         except ValueError:
             return default
 
-    def _series_key_from_result(self, r: Dict[str, Any]) -> Optional[Tuple[Tuple[str, tuple, str], float]]:
-        """Parse one VM instant-query result row. Returns ((metric_name, labels_wo_biz_date, biz_date_str), value_or_ts) or None."""
-        metric = r.get("metric", {})
-        val_list = r.get("value")
-        if not val_list:
-            return None
-        name = metric.get("__name__", "")
-        if not name:
-            return None
-        labels = {k: v for k, v in metric.items() if k != "__name__"}
-        biz_date_str = labels.get("biz_date", "")
-        if not biz_date_str:
-            return None
-        labels_wo_biz = tuple(sorted((k, v) for k, v in labels.items() if k != "biz_date"))
-        key = (name, labels_wo_biz, biz_date_str)
-        try:
-            val = float(val_list[1])
-        except (TypeError, ValueError, IndexError):
-            return None
-        return (key, val)
-
     def _query_series_to_convert(
         self,
         state: BusinessDateConverterState,
         prom: PrometheusConnect,
         selector: str,
         wm_ms: Optional[int],
-        window_s: int,
+        start_s: int,
+        end_s: int,
     ) -> List[Tuple[Tuple[str, tuple, str], float, int]]:
-        """Query VM with last_over_time and timestamp(); return list of (key, value, ts_ms) for series with ts > wm. No intermediate maps beyond correlation."""
-        wm_s = (wm_ms / 1000.0) if wm_ms is not None else None
-        window = f"{window_s}s"
+        """Single export query: GET /api/v1/export for selector in [start_s, end_s]; parse each line, take latest point per series, filter ts_ms > wm_ms. Returns list of (key, value, ts_ms)."""
+        to_write: List[Tuple[Tuple[str, tuple, str], float, int]] = []
         try:
-            res_val = prom.custom_query(query=f'last_over_time({selector}[{window}])')
-            res_ts = prom.custom_query(query=f'timestamp({selector}[{window}])')
-            # Correlate: we need value per key from first query
-            value_by_key: Dict[Tuple[str, tuple, str], float] = {}
-            for r in (res_val or []):
-                parsed = self._series_key_from_result(r)
-                if parsed:
-                    key, val = parsed
-                    value_by_key[key] = val
-            # Build single list of (key, value, ts_ms) where ts > wm
-            to_write: List[Tuple[Tuple[str, tuple, str], float, int]] = []
-            for r in (res_ts or []):
-                parsed = self._series_key_from_result(r)
-                if not parsed:
+            base_url = (state.vm_query_url or state.vm_gateway_url or "").rstrip("/")
+            if base_url.endswith("/api/v1"):
+                base_url = base_url[:-7]
+            elif base_url.endswith("/api"):
+                base_url = base_url[:-4]
+            headers = {}
+            if state.vm_token:
+                headers["Authorization"] = f"Bearer {state.vm_token}"
+            params = {"match[]": selector, "start": start_s, "end": end_s}
+            session = prom._session
+            resp = session.get(f"{base_url}/api/v1/export", params=params, headers=headers, timeout=60)
+            resp.raise_for_status()
+            for line in resp.text.strip().split("\n"):
+                if not line.strip():
                     continue
-                key, ts_val = parsed
-                if ts_val <= 0 or (wm_s is not None and ts_val <= wm_s):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
                     continue
-                if key not in value_by_key:
+                metric = row.get("metric", {})
+                name = metric.get("__name__", "")
+                if not name:
                     continue
-                to_write.append((key, value_by_key[key], int(ts_val * 1000)))
-            return to_write
+                labels = {k: v for k, v in metric.items() if k != "__name__"}
+                biz_date_str = labels.get("biz_date", "")
+                if not biz_date_str:
+                    continue
+                labels_wo_biz = tuple(sorted((k, v) for k, v in labels.items() if k != "biz_date"))
+                values = row.get("values", [])
+                timestamps = row.get("timestamps", [])
+                if not values or not timestamps:
+                    continue
+                value = float(values[-1])
+                ts_ms = int(float(timestamps[-1]))
+                if wm_ms is not None and ts_ms <= wm_ms:
+                    continue
+                key = (name, labels_wo_biz, biz_date_str)
+                to_write.append((key, value, ts_ms))
         except Exception as e:
-            self.logger.error(f"Query series to convert failed: {e}")
-            return []
+            self.logger.error(f"Export query failed: {e}")
+        return to_write
 
     def _read_day_watermark(
         self, state: BusinessDateConverterState, prom: PrometheusConnect, job: str, biz_date_iso: str, day_start_s: int
@@ -373,19 +371,10 @@ class BusinessDateConverterJob(BaseJob):
         self._write_metric_to_vm(state, line, timeout=30)
     
     def _get_prometheus_client(self, state: BusinessDateConverterState) -> PrometheusConnect:
-        """Get or create a PrometheusConnect instance for querying and writing metrics.
-        
-        Args:
-            state: Job state with VM configuration
-            
-        Returns:
-            PrometheusConnect instance configured with VM settings
-        """
+        """Get or create a PrometheusConnect instance (session used for export GET and watermark instant queries)."""
         headers = {}
         if state.vm_token:
             headers['Authorization'] = f'Bearer {state.vm_token}'
-        
-        # Use query URL if available, otherwise gateway URL
         url = state.vm_query_url or state.vm_gateway_url
         return PrometheusConnect(url=url, headers=headers, disable_ssl=True)
     
