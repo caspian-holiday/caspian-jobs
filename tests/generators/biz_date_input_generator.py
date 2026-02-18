@@ -2,6 +2,18 @@
 """
 Generate business-date (bd) side input metrics in Prometheus exposition format
 for feeding VictoriaMetrics and running the business_date_converter job.
+
+How to run:
+
+  # Print metrics to stdout
+  python3 tests/generators/biz_date_input_generator.py -j test_job --biz-dates 18/02/2025,17/02/2025 --metrics revenue_total
+
+  # Add market_hour label variants (e.g. 1h,2h,3h)
+  python3 tests/generators/biz_date_input_generator.py -j test_job --biz-dates 18/02/2025 --metrics revenue_total --market-hours 1h,2h,3h
+
+  # Feed into VictoriaMetrics (single-node)
+  python3 tests/generators/biz_date_input_generator.py -j test_job --biz-dates 18/02/2025 | \\
+    curl -X POST -H \"Content-Type: text/plain\" --data-binary @- \"http://<vm>:8428/api/v1/import/prometheus\"
 """
 
 from __future__ import annotations
@@ -15,6 +27,10 @@ from pathlib import Path
 def _parse_biz_dates(s: str) -> list[str]:
     """Parse comma-separated biz_dates in dd/mm/yyyy format; return as-is for validation."""
     return [d.strip() for d in s.split(",") if d.strip()]
+
+def _parse_market_hours(s: str) -> list[str]:
+    """Parse comma-separated market hours like 1h,2h,3h."""
+    return [h.strip() for h in s.split(",") if h.strip()]
 
 
 def _biz_dates_last_n_days(n: int, end_date: datetime | None = None) -> list[str]:
@@ -38,6 +54,7 @@ def generate(
     biz_dates: list[str],
     metric_names: list[str],
     series_count: int = 1,
+    market_hours: list[str] | None = None,
     base_timestamp: int | None = None,
     spread_minutes: int | None = None,
     extra_labels: dict[str, str] | None = None,
@@ -49,6 +66,7 @@ def generate(
     - biz_dates: list of "dd/mm/yyyy"
     - metric_names: e.g. ["revenue_total", "orders_count"]
     - series_count: number of label variants per (job, metric, biz_date) (e.g. env="test", region="eu")
+    - market_hours: optional market hour label values (e.g. ["1h","2h"])
     - base_timestamp: Unix seconds; if None, use now.
     - spread_minutes: if set, spread samples over the last N minutes (one step per series).
     - extra_labels: optional extra labels to add to every series (e.g. {"env": "test"}).
@@ -57,7 +75,8 @@ def generate(
     base_ts = base_timestamp if base_timestamp is not None else now
     extra = dict(extra_labels or {})
     lines = []
-    total_series = len(jobs) * len(biz_dates) * len(metric_names) * max(1, series_count)
+    mh_count = len(market_hours) if market_hours else 1
+    total_series = len(jobs) * len(biz_dates) * len(metric_names) * max(1, series_count) * mh_count
     step = (spread_minutes * 60) / max(1, total_series) if spread_minutes else 0
 
     idx = 0
@@ -65,16 +84,19 @@ def generate(
         for biz_date in biz_dates:
             for metric_name in metric_names:
                 for s in range(max(1, series_count)):
-                    labels = {"job": job, "biz_date": biz_date, **extra}
-                    if series_count > 1:
-                        labels["series_id"] = str(s)
-                    ts = base_ts
-                    if step > 0:
-                        ts = base_ts - int(idx * step)
-                    value = 100.0 + idx  # deterministic but distinct
-                    line = _build_line(metric_name, labels, value, ts)
-                    lines.append(line)
-                    idx += 1
+                    for mh in (market_hours or [None]):
+                        labels = {"job": job, "biz_date": biz_date, **extra}
+                        if series_count > 1:
+                            labels["series_id"] = str(s)
+                        if mh is not None:
+                            labels["market_hour"] = mh
+                        ts = base_ts
+                        if step > 0:
+                            ts = base_ts - int(idx * step)
+                        value = 100.0 + idx  # deterministic but distinct
+                        line = _build_line(metric_name, labels, value, ts)
+                        lines.append(line)
+                        idx += 1
     return lines
 
 
@@ -110,6 +132,11 @@ def main() -> int:
         default=1,
         metavar="N",
         help="Number of label variants per (job, metric, biz_date). Default: 1",
+    )
+    parser.add_argument(
+        "--market-hours",
+        type=str,
+        help='Comma-separated market_hour label values like "1h,2h,3h". If set, emits one series per market_hour for each (job,biz_date,metric,series_id).',
     )
     parser.add_argument(
         "--timestamp",
@@ -154,6 +181,7 @@ def main() -> int:
         biz_dates=biz_dates_list,
         metric_names=metric_list,
         series_count=args.series_count,
+        market_hours=_parse_market_hours(args.market_hours) if args.market_hours else None,
         base_timestamp=args.timestamp,
         spread_minutes=args.spread_minutes,
     )

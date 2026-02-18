@@ -112,6 +112,23 @@ def test_generate_expected_count():
 
 
 @pytest.mark.unit
+def test_generate_with_market_hours_count_and_label():
+    lines = generate(
+        jobs=["j1"],
+        biz_dates=["18/02/2025"],
+        metric_names=["m1"],
+        series_count=1,
+        market_hours=["1h", "2h", "3h"],
+        base_timestamp=1739880000,
+    )
+    assert len(lines) == 3
+    parsed = _parse_prom_line(lines[0])
+    assert parsed is not None
+    _, labels, _, _ = parsed
+    assert labels.get("market_hour") in {"1h", "2h", "3h"}
+
+
+@pytest.mark.unit
 def test_generate_cli_stdout(capsys):
     # Run CLI with fixed args and capture stdout
     sys.argv = [
@@ -120,6 +137,7 @@ def test_generate_cli_stdout(capsys):
         "--biz-dates", "18/02/2025",
         "--metrics", "only_metric",
         "--series-count", "1",
+        "--market-hours", "1h,2h",
     ]
     from tests.generators.biz_date_input_generator import main
     rc = main()
@@ -132,3 +150,4 @@ def test_generate_cli_stdout(capsys):
     _, labels, _, _ = parsed
     assert labels.get("job") == "cli_job"
     assert labels.get("biz_date") == "18/02/2025"
+    assert labels.get("market_hour") in {"1h", "2h"}
